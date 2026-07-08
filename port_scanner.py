@@ -17,6 +17,7 @@ IP 를 입력하면 대상 호스트의 포트 개폐 여부를 확인하고, �
 import argparse
 import concurrent.futures
 import ipaddress
+import json
 import platform
 import re
 import socket
@@ -24,6 +25,8 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 APP_NAME = "PortScanner"
 APP_VERSION = "1.0.0"
@@ -566,6 +569,128 @@ def save_results(result, path):
 
 
 # ---------------------------------------------------------------------------
+# HTML 연동 브리지 (로컬 HTTP 서버)
+# ---------------------------------------------------------------------------
+def result_to_dict(result):
+    """scan_target 결과를 HTML 이 소비할 JSON 딕셔너리로 변환한다."""
+    m = result["meta"]
+    return {
+        "ok": True,
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "target": m.get("forward_name") or m["ip"],
+        "ip": m["ip"],
+        "rdns": m.get("rdns"),
+        "reachable": m.get("reachable"),
+        "ttl": m.get("ttl"),
+        "rtt": m.get("rtt"),
+        "os": m.get("os"),
+        "scanned": result["scanned"],
+        "elapsed": round(result["elapsed"], 2),
+        "openCount": len(result["open"]),
+        "open": result["open"],
+        "nmap": build_nmap_block(m["ip"], result["open"]),
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+class _BridgeHandler(BaseHTTPRequestHandler):
+    server_version = "%s/%s" % (APP_NAME, APP_VERSION)
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        # Chrome Private Network Access 대응 (공용/파일 페이지 -> 사설 IP)
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+
+    def _json(self, obj, status=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self._cors()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        qs = parse_qs(parsed.query)
+
+        def q(name, default=None):
+            v = qs.get(name)
+            return v[0] if v else default
+
+        if path in ("", "/health"):
+            self._json({"ok": True, "app": APP_NAME, "version": APP_VERSION,
+                        "status": "running"})
+            return
+
+        if path == "/scan":
+            target = q("target") or q("ip")
+            if not target:
+                self._json({"ok": False, "error": "target 파라미터가 필요합니다."},
+                           status=400)
+                return
+            ports = q("ports", "top")
+            try:
+                timeout = float(q("timeout", "1.0"))
+                workers = int(q("workers", "200"))
+            except ValueError:
+                timeout, workers = 1.0, 200
+            print("  [브리지] 스캔 요청: %s (ports=%s)" % (target, ports))
+            try:
+                result = scan_target(target, ports, timeout, workers, quiet=True)
+            except Exception as e:  # noqa
+                self._json({"ok": False, "error": "스캔 오류: %s" % e}, status=500)
+                return
+            if not result:
+                self._json({"ok": False,
+                            "error": "대상을 해석할 수 없습니다: %s" % target},
+                           status=400)
+                return
+            data = result_to_dict(result)
+            print("  [브리지] 완료: %s 열린포트 %d개 (%.1fs)" % (
+                data["ip"], data["openCount"], data["elapsed"]))
+            self._json(data)
+            return
+
+        self._json({"ok": False, "error": "알 수 없는 경로: %s" % path}, status=404)
+
+    def log_message(self, fmt, *args):
+        # 기본 접근 로그는 억제 (요청 로그는 do_GET 에서 직접 출력)
+        pass
+
+
+def serve_bridge(host="127.0.0.1", port=8765):
+    enable_windows_ansi()
+    try:
+        httpd = ThreadingHTTPServer((host, port), _BridgeHandler)
+    except OSError as e:
+        print(C.R + "[!] 브리지 서버를 시작할 수 없습니다 (%s:%d): %s" % (
+            host, port, e) + C.END)
+        print(C.Y + "    다른 포트로 실행: PortScanner --serve --serve-port 8766" + C.END)
+        sys.exit(1)
+    print(C.CY + C.BOLD + "\n  == %s HTML 연동 브리지 서버 ==" % APP_NAME + C.END)
+    print(C.G + "  실행 중: http://%s:%d" % (host, port) + C.END)
+    print(C.DIM + "  상태확인: http://%s:%d/health" % (host, port) + C.END)
+    print(C.W + "  이제 HTML 점검 도구 ⑦ 탭에서 '실시간 스캔' 을 사용할 수 있습니다." + C.END)
+    print(C.Y + "  ※ 본인 소유/허가된 대상만 스캔하세요. (종료: Ctrl+C)\n" + C.END)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n브리지 서버를 종료합니다.")
+        httpd.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def interactive_menu():
@@ -645,6 +770,12 @@ def main():
     parser.add_argument("-w", "--workers", type=int, default=200,
                         help="동시 스캔 스레드 수 (기본 200)")
     parser.add_argument("-o", "--output", help="결과를 지정 파일에 저장")
+    parser.add_argument("--serve", action="store_true",
+                        help="HTML 연동 브리지 서버 모드로 실행")
+    parser.add_argument("--serve-host", default="127.0.0.1",
+                        help="브리지 서버 바인드 호스트 (기본 127.0.0.1)")
+    parser.add_argument("--serve-port", type=int, default=8765,
+                        help="브리지 서버 포트 (기본 8765)")
     parser.add_argument("--no-color", action="store_true", help="컬러 출력 끄기")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="진행 표시 없이 결과만 출력")
@@ -656,6 +787,10 @@ def main():
         C.disable()
     else:
         enable_windows_ansi()
+
+    if args.serve:
+        serve_bridge(args.serve_host, args.serve_port)
+        return
 
     if not args.target:
         interactive_menu()
