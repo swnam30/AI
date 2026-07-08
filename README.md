@@ -1,0 +1,91 @@
+# PortScanner — nmap 유사 포트 스캐너
+
+FortiGate 점검 단일 HTML 도구의 **⑦ 포트/서비스 위험도 분석** 탭과 연동하기 위한
+독립 실행형(EXE) 포트 스캐너입니다. 단일 HTML(브라우저)에서는 보안 정책상 원격
+포트 스캔이 불가능하므로, 실제 스캔은 이 EXE 가 수행하고 **결과(nmap 형식)를
+HTML 도구에 붙여넣어** 위험도를 분석하는 워크플로우입니다.
+
+```
+[PortScanner.exe] --스캔--> nmap 형식 결과 --복사/붙여넣기--> [HTML ⑦ 포트 분석 탭] --> 위험도 분류
+```
+
+## 주요 기능
+
+- **포트 개폐 확인** — TCP connect 스캔 (멀티스레드, 관리자 권한 불필요)
+- **서비스 식별** — 배너 그래빙 + 포트 매핑 (`ssh`, `http`, `mysql` 등)
+- **버전/제품 탐지** — 배너에서 OpenSSH, nginx, IIS, FortiOS 등 추출
+- **OS 추정** — 시스템 ping 의 **TTL 값**(64/128/255)과 배너 근거로 계열 추정
+- **호스트 정보** — 정방향/역방향 DNS, 도달 여부, 응답시간(RTT)
+- **nmap 형식 출력** — HTML 도구 ⑦ 탭에 그대로 붙여넣기 가능
+- **결과 저장** — 리포트 + nmap 블록을 `.txt` 로 저장
+
+## 사용법
+
+### 대화형 (더블클릭 실행)
+`PortScanner.exe` 를 그냥 실행하면 대상 IP·포트 범위를 물어보는 메뉴가 나옵니다.
+
+### 명령행
+```bat
+PortScanner.exe 192.168.1.1                 :: 주요 공통 포트 스캔
+PortScanner.exe 192.168.1.1 -p 1-1024       :: well-known 포트
+PortScanner.exe 192.168.1.1 -p all          :: 전체 65535 포트 (느림)
+PortScanner.exe 10.0.0.5 -p 22,80,443,3389  :: 특정 포트만
+PortScanner.exe 10.0.0.5 -o result.txt      :: 결과 파일 저장
+PortScanner.exe host.example.com -q          :: 진행표시 없이 결과만
+```
+
+| 옵션 | 설명 | 기본값 |
+|------|------|--------|
+| `-p, --ports` | `top` \| `all` \| `1-1024` \| `22,80,443` | `top` |
+| `-t, --timeout` | 포트당 연결 타임아웃(초) | `1.0` |
+| `-w, --workers` | 동시 스캔 스레드 수 | `200` |
+| `-o, --output` | 결과 저장 파일 경로 | 없음 |
+| `--no-color` | 컬러 출력 끄기 | - |
+| `-q, --quiet` | 진행 표시 없이 결과만 | - |
+
+## HTML 도구와 연동하는 방법
+
+1. `PortScanner.exe` 로 대상 IP 를 스캔합니다.
+2. 출력 하단의 **`[ HTML 도구 ⑦ 포트 분석 탭에 붙여넣기용 (nmap 형식) ]`** 블록을 복사합니다.
+   ```
+   22/tcp   open  ssh
+   80/tcp   open  http
+   3389/tcp open  ms-wbt-server
+   ```
+3. HTML 점검 도구 → **⑦ 포트/서비스 위험도 분석** 탭 → 입력창에 붙여넣고 **🔍 분석** 클릭.
+4. 포트별 위험도(High/Medium/Low/Safe)와 권고사항이 자동 분류됩니다.
+
+## EXE 빌드 방법
+
+### 방법 A. GitHub Actions (권장, 자동)
+이 브랜치에 push 하면 `.github/workflows/build-exe.yml` 가 **Windows 러너에서
+자동으로 EXE 를 빌드**합니다. 완료 후 GitHub → **Actions** 탭 → 해당 실행 →
+**Artifacts** 에서 `PortScanner-windows-exe` 를 다운로드하세요.
+수동 실행은 Actions 탭에서 **Run workflow** (`workflow_dispatch`) 로도 가능합니다.
+
+### 방법 B. 로컬 Windows PC 에서 빌드
+Python 3.8+ 가 설치된 Windows 에서:
+```bat
+build.bat
+```
+빌드가 끝나면 `dist\PortScanner.exe` 가 생성됩니다.
+
+수동으로 하려면:
+```bat
+pip install pyinstaller
+pyinstaller --onefile --console --name PortScanner port_scanner.py
+```
+
+### 소스로 바로 실행 (빌드 없이)
+Python 이 설치되어 있다면 EXE 없이도 실행 가능합니다:
+```bat
+python port_scanner.py 192.168.1.1
+```
+> 표준 라이브러리만 사용하므로 추가 패키지 설치가 필요 없습니다.
+
+## ⚠️ 사용 시 주의
+
+포트 스캔은 **본인이 소유하거나 명시적으로 스캔 허가를 받은 시스템**에만
+사용해야 합니다. 허가 없이 타인의 네트워크/호스트를 스캔하는 행위는 관련 법률
+(정보통신망법 등) 위반이 될 수 있습니다. 이 도구는 사내 자산 점검·감사 등
+**정당한 권한이 있는 환경**에서의 사용을 전제로 합니다.

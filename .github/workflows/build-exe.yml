@@ -1,0 +1,38 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches:
+      - "claude/port-scanner-exe-b25kju"
+    paths:
+      - "port_scanner.py"
+      - ".github/workflows/build-exe.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build EXE
+        run: python -m PyInstaller --onefile --console --name PortScanner port_scanner.py
+
+      - name: Smoke test
+        run: dist\PortScanner.exe --version
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PortScanner-windows-exe
+          path: dist/PortScanner.exe
+          if-no-files-found: error

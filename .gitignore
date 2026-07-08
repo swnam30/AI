@@ -1,0 +1,16 @@
+# PyInstaller 빌드 산출물
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 스캔 결과
+scan_*.txt
+
+# OS
+.DS_Store
+Thumbs.db
