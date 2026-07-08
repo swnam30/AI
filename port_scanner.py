@@ -693,7 +693,7 @@ def serve_bridge(host="127.0.0.1", port=8765):
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def interactive_menu():
+def print_banner():
     enable_windows_ansi()
     print(C.CY + C.BOLD + r"""
    ____            _   ____
@@ -704,7 +704,50 @@ def interactive_menu():
 """ + C.END)
     print(C.DIM + "  %s v%s  -  FortiGate 점검 도구 ⑦ 포트 분석 연동 스캐너" % (
         APP_NAME, APP_VERSION) + C.END)
-    print(C.Y + "  ※ 본인이 관리하거나 명시적으로 스캔 허가를 받은 대상에만 사용하세요.\n" + C.END)
+    print(C.Y + "  ※ 본인이 관리하거나 명시적으로 스캔 허가를 받은 대상에만 사용하세요." + C.END)
+
+
+def startup_chooser():
+    """더블클릭(인자 없음) 실행 시 단일/서버 모드를 선택하는 시작 화면."""
+    print_banner()
+    while True:
+        print()
+        print(C.W + C.BOLD + "  실행 모드를 선택하세요:" + C.END)
+        print("    1) 단일 스캔 모드   - IP 를 직접 입력해 콘솔에서 스캔")
+        print("    2) 서버 모드        - HTML ⑦ 탭의 '실시간 스캔' 과 연동")
+        print(C.DIM + "    q) 종료" + C.END)
+        try:
+            choice = input(C.W + "  선택 [1] > " + C.END).strip().lower() or "1"
+        except (EOFError, KeyboardInterrupt):
+            print("\n종료합니다.")
+            return
+
+        if choice in ("q", "quit", "exit"):
+            print("종료합니다.")
+            return
+        if choice == "1":
+            interactive_menu(show_banner=False)
+            return
+        if choice == "2":
+            try:
+                pin = input(C.W + "  서버 포트 [8765] > " + C.END).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n종료합니다.")
+                return
+            try:
+                port = int(pin) if pin else 8765
+            except ValueError:
+                port = 8765
+            # 서버는 이 프로세스에서 실행되므로 창을 닫거나 Ctrl+C 시 함께 종료됨
+            serve_bridge("127.0.0.1", port)
+            return
+        print(C.Y + "  1, 2 또는 q 를 입력하세요." + C.END)
+
+
+def interactive_menu(show_banner=True):
+    if show_banner:
+        print_banner()
+        print()
 
     while True:
         try:
@@ -793,7 +836,7 @@ def main():
         return
 
     if not args.target:
-        interactive_menu()
+        startup_chooser()
         return
 
     result = scan_target(args.target, args.ports, args.timeout,
