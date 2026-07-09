@@ -841,6 +841,33 @@ th.th-dst-intf { background: #dcfce7; color: #14532d; }
       <div id="paHostInfo" style="display:none;margin-top:10px;font-size:12px;background:#fff;border:1px solid #e0e0e0;border-radius:6px;padding:10px"></div>
     </div>
 
+    <!-- ===== 대역 스윕 (IP 충돌 예방) ===== -->
+    <div style="border:1px solid #b2dfdb;background:#f1f8f7;border-radius:8px;padding:12px;margin-bottom:14px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+        <span style="font-size:13px;font-weight:bold;color:#00695c">🌐 대역 스윕 (IP 충돌 예방)</span>
+        <span style="flex:1"></span>
+        <span style="font-size:11px;color:#888">대역 내 사용중/빈 IP 확인 · 서버 모드 필요</span>
+      </div>
+      <div style="font-size:11px;color:#555;margin-bottom:8px;line-height:1.5">
+        고정 IP 배정 전, 대역 내 이미 사용 중인 IP 를 확인해 <b>충돌을 예방</b>합니다.
+        TCP 프로브 + ARP + ICMP 를 조합하며, <b>스캔 PC 를 해당 대역에 두고</b> 실행할수록 정확합니다.
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+        <div>
+          <div style="font-size:11px;color:#555;margin-bottom:2px">대상 대역 (CIDR 또는 범위)</div>
+          <input id="paSweepCidr" type="text" placeholder="예: 192.168.10.0/24  또는  10.0.0.1-100"
+            style="width:280px;font-family:monospace;font-size:13px;border:1px solid #80cbc4;border-radius:6px;padding:6px 8px;box-sizing:border-box">
+        </div>
+        <label style="font-size:12px;color:#555;display:flex;align-items:center;gap:4px">
+          <input id="paSweepPing" type="checkbox" checked> ICMP 포함
+        </label>
+        <button class="btn btn-primary" onclick="paSweepScan()" id="paSweepBtn" style="background:#00695c">🌐 대역 스캔</button>
+      </div>
+      <div id="paSweepSummary" style="display:none;margin-top:10px;font-size:13px;font-weight:bold"></div>
+      <div id="paSweepResult" style="display:none;margin-top:8px;overflow-x:auto"></div>
+      <div id="paSweepFree" style="display:none;margin-top:8px;font-size:12px;background:#fff;border:1px solid #c8e6c9;border-radius:6px;padding:8px"></div>
+    </div>
+
     <div style="display:flex;gap:12px;flex-wrap:wrap">
       <div style="flex:1;min-width:280px">
         <div style="font-size:12px;font-weight:bold;margin-bottom:4px;color:#1565c0">입력</div>
@@ -5080,6 +5107,7 @@ var PA_SVC_MAP = {
 };
 
 var _paResults = [];
+var _paSweep = null;
 
 // ===== PortScanner.exe 브리지 연동 =====
 function paBridgeBase() {
@@ -5168,6 +5196,88 @@ function paBridgeScan() {
     .finally(function(){
       btn.disabled = false; btn.textContent = '🔍 실시간 스캔';
     });
+}
+
+// ===== 대역 스윕 (IP 충돌 예방) =====
+function paSweepScan() {
+  var cidr = (document.getElementById('paSweepCidr').value || '').trim();
+  if (!cidr) { alert('스캔할 대역을 입력하세요. (예: 192.168.10.0/24)'); return; }
+  var ping = document.getElementById('paSweepPing').checked ? '1' : '0';
+
+  var btn = document.getElementById('paSweepBtn');
+  btn.disabled = true; btn.textContent = '⏳ 대역 스캔 중…';
+  paSetBridgeStatus('busy', '대역 스캔 중…');
+  document.getElementById('paSweepSummary').style.display = 'none';
+  document.getElementById('paSweepResult').style.display = 'none';
+  document.getElementById('paSweepFree').style.display = 'none';
+
+  var url = paBridgeBase() + '/sweep?cidr=' + encodeURIComponent(cidr) + '&ping=' + ping;
+  fetch(url, {cache:'no-store'})
+    .then(function(r){ return r.json().then(function(j){ return {status:r.status, body:j}; }); })
+    .then(function(res){
+      var j = res.body;
+      if (!j || !j.ok) {
+        paSetBridgeStatus('off', '오류');
+        alert('대역 스캔 실패: ' + ((j && j.error) || ('HTTP ' + res.status)));
+        return;
+      }
+      paSetBridgeStatus('ok', '완료 (점유 ' + j.usedCount + ')');
+      paRenderSweep(j);
+    })
+    .catch(function(e){
+      paSetBridgeStatus('off', '연결 안됨');
+      alert('브리지 서버에 연결할 수 없습니다. PortScanner 를 서버 모드로 실행했는지 확인하세요.\n\n' + e);
+    })
+    .finally(function(){
+      btn.disabled = false; btn.textContent = '🌐 대역 스캔';
+    });
+}
+
+function paRenderSweep(j) {
+  function esc(s){ return String(s==null?'':s).replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
+  _paSweep = j;
+
+  var sum = document.getElementById('paSweepSummary');
+  sum.innerHTML = '대역 <span style="color:#00695c">' + esc(j.network) + '</span> — ' +
+    '전체 <b>' + j.total + '</b> · ' +
+    '<span style="color:#c62828">점유 ' + j.usedCount + '</span> · ' +
+    '<span style="color:#2e7d32">미사용 ' + j.freeCount + '</span> ' +
+    '<span style="font-weight:400;color:#888;font-size:11px">(' + j.elapsed + '초)</span>';
+  sum.style.display = 'block';
+
+  var res = document.getElementById('paSweepResult');
+  if (j.used && j.used.length) {
+    var html = '<table style="width:100%;border-collapse:collapse;font-size:12px">' +
+      '<thead><tr style="background:#00695c;color:#fff">' +
+      '<th style="padding:5px 8px;text-align:left">IP (점유중 — 배정 금지)</th>' +
+      '<th style="padding:5px 8px;text-align:left">MAC</th>' +
+      '<th style="padding:5px 8px;text-align:left">호스트명</th>' +
+      '<th style="padding:5px 8px;text-align:left">열린 포트</th>' +
+      '<th style="padding:5px 8px;text-align:left">탐지</th></tr></thead><tbody>';
+    j.used.forEach(function(u){
+      html += '<tr style="border-bottom:1px solid #eee">' +
+        '<td style="padding:5px 8px;font-family:monospace;font-weight:bold">' + esc(u.ip) + '</td>' +
+        '<td style="padding:5px 8px;font-family:monospace">' + esc(u.mac || '-') + '</td>' +
+        '<td style="padding:5px 8px">' + esc(u.hostname || '-') + '</td>' +
+        '<td style="padding:5px 8px">' + esc((u.open_ports || []).join(', ') || '-') + '</td>' +
+        '<td style="padding:5px 8px;color:#666">' + esc((u.methods || []).join(',') || '-') + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    res.innerHTML = html;
+  } else {
+    res.innerHTML = '<div style="color:#2e7d32;padding:8px">점유 중인 호스트가 발견되지 않았습니다.</div>';
+  }
+  res.style.display = 'block';
+
+  var freeBox = document.getElementById('paSweepFree');
+  var free = j.free || [];
+  var shown = free.slice(0, 256);
+  freeBox.innerHTML = '<div style="font-weight:bold;color:#2e7d32;margin-bottom:4px">🟢 배정 가능한(미사용) IP ' +
+    '<span style="font-weight:400;color:#888">— ' + free.length + '개</span></div>' +
+    '<div style="font-family:monospace;color:#333;line-height:1.6;word-break:break-all">' +
+    (shown.map(esc).join(', ') || '(없음)') +
+    (free.length > shown.length ? (' … 외 ' + (free.length - shown.length) + '개') : '') + '</div>';
+  freeBox.style.display = 'block';
 }
 
 function paRenderHostInfo(j) {

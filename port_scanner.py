@@ -16,6 +16,7 @@ IP 를 입력하면 대상 호스트의 포트 개폐 여부를 확인하고, �
 
 import argparse
 import concurrent.futures
+import errno
 import ipaddress
 import json
 import platform
@@ -145,16 +146,16 @@ def resolve_target(target):
 # ---------------------------------------------------------------------------
 # TTL / 응답시간 측정 (시스템 ping 이용 - 관리자 권한 불필요)
 # ---------------------------------------------------------------------------
-def ping_host(ip, timeout=2):
+def ping_host(ip, timeout=2, count=2):
     """시스템 ping 을 실행해 (도달여부, TTL, 평균응답ms) 를 반환한다."""
     system = platform.system()
     if system == "Windows":
-        cmd = ["ping", "-n", "2", "-w", str(int(timeout * 1000)), ip]
+        cmd = ["ping", "-n", str(count), "-w", str(int(timeout * 1000)), ip]
     else:
-        cmd = ["ping", "-c", "2", "-W", str(int(timeout)), ip]
+        cmd = ["ping", "-c", str(count), "-W", str(int(max(timeout, 1))), ip]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True,
-                             timeout=timeout * 4 + 4)
+                             timeout=timeout * count + 4)
         text = (out.stdout or "") + (out.stderr or "")
     except Exception:
         return False, None, None
@@ -605,6 +606,224 @@ def parse_ports(spec):
 
 
 # ---------------------------------------------------------------------------
+# 네트워크 대역 스윕 (Host Discovery) - IP 충돌 예방용
+# ---------------------------------------------------------------------------
+SWEEP_MAX_HOSTS = 8192   # 한 번에 스윕 가능한 최대 호스트 수 (/19)
+# 존재 여부 판별에 쓰는 소수 정예 포트 (open 또는 refused 응답이면 호스트 존재)
+SWEEP_PROBE_PORTS = [445, 139, 135, 80, 443, 22, 3389, 62078]
+_REFUSED = {errno.ECONNREFUSED, 10061}   # Linux/Windows 연결거부 코드
+
+
+def parse_hosts(spec):
+    """CIDR('192.168.1.0/24') 또는 범위('192.168.1.10-50', '10.0.0.1-10.0.0.100')
+    또는 단일 IP 를 IP 문자열 리스트로 변환한다."""
+    spec = (spec or "").strip()
+    if not spec:
+        return []
+    if "/" in spec:
+        net = ipaddress.ip_network(spec, strict=False)
+        hosts = [str(h) for h in net.hosts()]
+        # /31, /32 처리: hosts() 가 빈 경우 네트워크 주소 자체 사용
+        if not hosts:
+            hosts = [str(net.network_address)]
+        return hosts
+    if "-" in spec:
+        a, b = spec.split("-", 1)
+        a = a.strip()
+        b = b.strip()
+        start = ipaddress.ip_address(a)
+        if "." in b:
+            end = ipaddress.ip_address(b)
+        else:
+            prefix = a.rsplit(".", 1)[0]
+            end = ipaddress.ip_address(prefix + "." + b)
+        lo, hi = int(start), int(end)
+        if hi < lo:
+            lo, hi = hi, lo
+        return [str(ipaddress.ip_address(i)) for i in range(lo, hi + 1)]
+    # 단일 IP
+    ipaddress.ip_address(spec)
+    return [spec]
+
+
+def _normalize_mac(mac):
+    mac = mac.replace("-", ":").upper()
+    return mac
+
+
+def read_arp_table():
+    """시스템 ARP 테이블을 읽어 {ip: mac} 딕셔너리를 반환한다."""
+    table = {}
+    cmds = []
+    if platform.system() == "Windows":
+        cmds = [["arp", "-a"]]
+    else:
+        cmds = [["ip", "neigh"], ["arp", "-an"], ["arp", "-a"]]
+    text = ""
+    for cmd in cmds:
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+            text = (out.stdout or "")
+            if text.strip():
+                break
+        except Exception:
+            continue
+    mac_re = re.compile(r"([0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5})")
+    ip_re = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})")
+    for line in text.splitlines():
+        ipm = ip_re.search(line)
+        macm = mac_re.search(line)
+        if ipm and macm:
+            mac = _normalize_mac(macm.group(1))
+            if mac in ("FF:FF:FF:FF:FF:FF", "00:00:00:00:00:00"):
+                continue
+            table[ipm.group(1)] = mac
+    return table
+
+
+def _probe_alive(ip, timeout):
+    """단일 IP 존재 여부를 TCP(open/refused)로 판별하고 ARP 해석을 유도한다."""
+    alive = False
+    methods = []
+    open_ports = []
+    # UDP nudge: 즉시 반환되며 OS 가 대상 MAC 을 ARP 로 해석하게 만든다
+    try:
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.sendto(b"\x00", (ip, 40125))
+        u.close()
+    except Exception:
+        pass
+    for p in SWEEP_PROBE_PORTS:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            r = s.connect_ex((ip, p))
+            if r == 0:
+                alive = True
+                open_ports.append(p)
+                if "TCP" not in methods:
+                    methods.append("TCP")
+            elif r in _REFUSED:
+                alive = True
+                if "TCP(refused)" not in methods:
+                    methods.append("TCP(refused)")
+        except Exception:
+            pass
+        finally:
+            s.close()
+        if alive and open_ports:
+            break  # 열린 포트 하나 찾으면 조기 종료(속도)
+    return ip, alive, methods, open_ports
+
+
+def sweep_network(spec, timeout=0.4, workers=100, do_ping=True,
+                  identify=True, on_progress=None):
+    """네트워크 대역을 스윕해 점유(used)/미사용(free) IP 를 판별한다."""
+    hosts = parse_hosts(spec)
+    if len(hosts) > SWEEP_MAX_HOSTS:
+        raise ValueError("대상 호스트가 %d개로 너무 많습니다 (최대 %d, 약 /19). "
+                         "범위를 좁혀주세요." % (len(hosts), SWEEP_MAX_HOSTS))
+
+    start = time.time()
+    total = len(hosts)
+    done = 0
+    alive_map = {}   # ip -> {methods, open_ports}
+
+    # 1단계: TCP 프로브 + ARP 유도 (병렬)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_probe_alive, ip, timeout): ip for ip in hosts}
+        for fut in concurrent.futures.as_completed(futs):
+            done += 1
+            if on_progress:
+                on_progress(done, total)
+            ip, alive, methods, openp = fut.result()
+            if alive:
+                alive_map[ip] = {"methods": list(methods), "open_ports": openp}
+
+    # 2단계: ICMP ping (아직 미확인 호스트만, 병렬) — ICMP만 응답하는 호스트 포착
+    if do_ping:
+        pending = [ip for ip in hosts if ip not in alive_map]
+        if pending:
+            def _p(ip):
+                reachable, ttl, _ = ping_host(ip, timeout=max(timeout, 1), count=1)
+                return ip, reachable, ttl
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, 64)) as ex:
+                for fut in concurrent.futures.as_completed(
+                        [ex.submit(_p, ip) for ip in pending]):
+                    ip, reachable, ttl = fut.result()
+                    if reachable:
+                        alive_map[ip] = {"methods": ["ICMP"], "open_ports": []}
+
+    # 3단계: ARP 테이블 읽기 — L2 응답(방화벽 뒤 호스트 포함) 포착 + MAC 확보
+    host_set = set(hosts)
+    arp = read_arp_table()
+    for ip, mac in arp.items():
+        if ip in host_set:
+            entry = alive_map.setdefault(ip, {"methods": [], "open_ports": []})
+            if "ARP" not in entry["methods"]:
+                entry["methods"].append("ARP")
+            entry["mac"] = mac
+
+    # 4단계: 점유 호스트 식별 (역방향 DNS + NetBIOS 이름)
+    used = []
+    for ip in sorted(alive_map, key=lambda x: tuple(int(o) for o in x.split("."))):
+        entry = alive_map[ip]
+        hostname = None
+        if identify:
+            try:
+                hostname = socket.gethostbyaddr(ip)[0]
+            except Exception:
+                hostname = None
+            if not hostname:
+                nb = netbios_query(ip, timeout=1.0)
+                if nb and nb.get("name"):
+                    hostname = nb["name"]
+                    if not entry.get("mac") and nb.get("mac"):
+                        entry["mac"] = nb["mac"]
+        used.append({
+            "ip": ip,
+            "mac": entry.get("mac"),
+            "hostname": hostname,
+            "methods": entry["methods"],
+            "open_ports": entry.get("open_ports", []),
+        })
+
+    used_ips = {u["ip"] for u in used}
+    free = [ip for ip in hosts if ip not in used_ips]
+
+    return {
+        "network": spec,
+        "total": total,
+        "used": used,
+        "usedCount": len(used),
+        "free": free,
+        "freeCount": len(free),
+        "elapsed": round(time.time() - start, 2),
+    }
+
+
+def summarize_free(free):
+    """미사용 IP 리스트를 연속 구간으로 압축한다 (예: 10-25, 30, 40-42)."""
+    if not free:
+        return ""
+    nums = sorted(int(ipaddress.ip_address(ip)) for ip in free)
+    ranges = []
+    s = p = nums[0]
+    for n in nums[1:]:
+        if n == p + 1:
+            p = n
+            continue
+        ranges.append((s, p))
+        s = p = n
+    ranges.append((s, p))
+    parts = []
+    for a, b in ranges:
+        ia, ib = str(ipaddress.ip_address(a)), str(ipaddress.ip_address(b))
+        parts.append(ia if a == b else "%s ~ %s" % (ia, ib))
+    return ", ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # 출력
 # ---------------------------------------------------------------------------
 def print_progress(done, total):
@@ -629,6 +848,43 @@ def build_nmap_block(ip, open_infos):
         ver = info.get("product") or ""
         line = "%-9s open  %-15s %s" % ("%d/tcp" % port, svc, ver)
         lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
+def build_sweep_report(res):
+    """대역 스윕 결과를 텍스트 리포트로 만든다."""
+    lines = []
+    lines.append("=" * 72)
+    lines.append(" %s v%s - 네트워크 대역 스윕 (IP 충돌 예방)" % (APP_NAME, APP_VERSION))
+    lines.append("=" * 72)
+    lines.append(" 대상 대역   : %s" % res["network"])
+    lines.append(" 전체 호스트 : %d개    점유(사용중): %d개    미사용(비어있음): %d개" % (
+        res["total"], res["usedCount"], res["freeCount"]))
+    lines.append(" 소요 시간   : %.1f 초" % res["elapsed"])
+    lines.append("-" * 72)
+    if res["used"]:
+        lines.append(" [ 점유 중인 IP — 이 주소는 이미 사용 중이므로 배정 금지 ]")
+        lines.append(" %-16s %-18s %-22s %s" % ("IP", "MAC", "호스트명", "탐지"))
+        lines.append(" " + "-" * 70)
+        for u in res["used"]:
+            lines.append(" %-16s %-18s %-22s %s" % (
+                u["ip"], u.get("mac") or "-",
+                (u.get("hostname") or "-")[:22],
+                ",".join(u.get("methods", [])) or "-"))
+    else:
+        lines.append(" 점유 중인 호스트가 발견되지 않았습니다.")
+    lines.append("-" * 72)
+    lines.append(" [ 미사용(배정 가능) IP 요약 ]")
+    free_sum = summarize_free(res["free"])
+    if free_sum:
+        # 너무 길면 줄바꿈
+        for i in range(0, len(free_sum), 68):
+            lines.append("  " + free_sum[i:i + 68])
+    else:
+        lines.append("  (없음)")
+    lines.append("=" * 72)
+    lines.append(" ※ 사내 여러 대역에서 정확도를 높이려면 스캔 PC 를 해당 대역에 두고")
+    lines.append("   실행하세요 (ARP 는 같은 L2 세그먼트에서 가장 정확).")
     return "\n".join(lines)
 
 
@@ -867,6 +1123,34 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             self._json(data)
             return
 
+        if path == "/sweep":
+            cidr = q("cidr") or q("network") or q("range")
+            if not cidr:
+                self._json({"ok": False, "error": "cidr 파라미터가 필요합니다."},
+                           status=400)
+                return
+            try:
+                timeout = float(q("timeout", "0.4"))
+                workers = int(q("workers", "100"))
+            except ValueError:
+                timeout, workers = 0.4, 100
+            do_ping = q("ping", "1") not in ("0", "false", "no")
+            print("  [브리지] 대역 스윕 요청: %s" % cidr)
+            try:
+                res = sweep_network(cidr, timeout=timeout, workers=workers,
+                                    do_ping=do_ping)
+            except ValueError as e:
+                self._json({"ok": False, "error": str(e)}, status=400)
+                return
+            except Exception as e:  # noqa
+                self._json({"ok": False, "error": "스윕 오류: %s" % e}, status=500)
+                return
+            res["ok"] = True
+            print("  [브리지] 스윕 완료: %s 점유 %d / 미사용 %d (%.1fs)" % (
+                cidr, res["usedCount"], res["freeCount"], res["elapsed"]))
+            self._json(res)
+            return
+
         self._json({"ok": False, "error": "알 수 없는 경로: %s" % path}, status=404)
 
     def log_message(self, fmt, *args):
@@ -920,6 +1204,7 @@ def startup_chooser():
         print(C.W + C.BOLD + "  실행 모드를 선택하세요:" + C.END)
         print("    1) 단일 스캔 모드   - IP 를 직접 입력해 콘솔에서 스캔")
         print("    2) 서버 모드        - HTML ⑦ 탭의 '실시간 스캔' 과 연동")
+        print("    3) 대역 스윕 모드   - 대역 내 사용중/빈 IP 확인 (IP 충돌 예방)")
         print(C.DIM + "    q) 종료" + C.END)
         try:
             choice = input(C.W + "  선택 [1] > " + C.END).strip().lower() or "1"
@@ -932,6 +1217,9 @@ def startup_chooser():
             return
         if choice == "1":
             interactive_menu(show_banner=False)
+            return
+        if choice == "3":
+            sweep_menu()
             return
         if choice == "2":
             try:
@@ -947,6 +1235,57 @@ def startup_chooser():
             serve_bridge("127.0.0.1", port)
             return
         print(C.Y + "  1, 2 또는 q 를 입력하세요." + C.END)
+
+
+def sweep_menu():
+    """대역 스윕 대화형 실행."""
+    print(C.CY + C.BOLD + "\n  == 네트워크 대역 스윕 (IP 충돌 예방) ==" + C.END)
+    print(C.DIM + "  대역 내 어떤 IP 가 사용 중이고 어떤 IP 가 비어있는지 확인합니다." + C.END)
+    print(C.Y + "  ※ 스캔 PC 를 확인하려는 대역에 두고 실행할수록 정확합니다 (ARP 기반).\n" + C.END)
+    while True:
+        try:
+            spec = input(C.W + "  대상 대역 (예: 192.168.10.0/24, 10.0.0.1-100) (종료 q) > " + C.END).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n종료합니다.")
+            return
+        if spec.lower() in ("q", "quit", "exit"):
+            print("종료합니다.")
+            return
+        if not spec:
+            continue
+        try:
+            res = run_sweep(spec, quiet=False)
+        except ValueError as e:
+            print(C.R + "  [!] %s" % e + C.END)
+            continue
+        except Exception as e:  # noqa
+            print(C.R + "  [!] 오류: %s" % e + C.END)
+            continue
+        report = build_sweep_report(res)
+        print("\n" + colorize_report(report))
+        try:
+            ans = input(C.W + "\n  결과를 파일로 저장할까요? (y/N) > " + C.END).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans == "y":
+            fname = "sweep_%s_%s.txt" % (
+                re.sub(r"[^0-9]", "_", spec)[:20],
+                datetime.now().strftime("%Y%m%d_%H%M%S"))
+            with open(fname, "w", encoding="utf-8") as f:
+                f.write(report + "\n")
+            print(C.G + "  저장됨: %s" % fname + C.END)
+        print()
+
+
+def run_sweep(spec, timeout=0.4, workers=100, do_ping=True, quiet=False):
+    """대역 스윕을 실행하고 결과 딕셔너리를 반환한다 (콘솔 진행표시 포함)."""
+    if not quiet:
+        hosts = parse_hosts(spec)
+        print(C.B + "[*] 대상 대역: %s  (호스트 %d개)" % (spec, len(hosts)) + C.END)
+        print(C.B + "[*] 스윕 시작 (TCP 프로브 + ARP + ICMP)..." + C.END)
+    res = sweep_network(spec, timeout=timeout, workers=workers, do_ping=do_ping,
+                        on_progress=None if quiet else print_progress)
+    return res
 
 
 def interactive_menu(show_banner=True):
@@ -1018,6 +1357,11 @@ def main():
     parser.add_argument("-w", "--workers", type=int, default=200,
                         help="동시 스캔 스레드 수 (기본 200)")
     parser.add_argument("-o", "--output", help="결과를 지정 파일에 저장")
+    parser.add_argument("--sweep",
+                        help="대역 스윕 모드: 사용중/빈 IP 확인 "
+                             "(예: 192.168.10.0/24, 10.0.0.1-100)")
+    parser.add_argument("--no-ping", action="store_true",
+                        help="대역 스윕 시 ICMP ping 단계 생략")
     parser.add_argument("--serve", action="store_true",
                         help="HTML 연동 브리지 서버 모드로 실행")
     parser.add_argument("--serve-host", default="127.0.0.1",
@@ -1038,6 +1382,22 @@ def main():
 
     if args.serve:
         serve_bridge(args.serve_host, args.serve_port)
+        return
+
+    if args.sweep:
+        try:
+            res = run_sweep(args.sweep, timeout=max(args.timeout * 0.4, 0.3),
+                            workers=min(args.workers, 150),
+                            do_ping=not args.no_ping, quiet=args.quiet)
+        except ValueError as e:
+            print(C.R + "[!] %s" % e + C.END)
+            sys.exit(1)
+        report = build_sweep_report(res)
+        print("\n" + (report if args.no_color else colorize_report(report)))
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(report + "\n")
+            print("\n저장됨: %s" % args.output)
         return
 
     if not args.target:
