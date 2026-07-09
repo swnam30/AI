@@ -18,10 +18,19 @@ HTML 도구에 붙여넣어** 위험도를 분석하는 워크플로우입니다
 - **포트 개폐 확인** — TCP connect 스캔 (멀티스레드, 관리자 권한 불필요)
 - **서비스 식별** — 배너 그래빙 + 포트 매핑 (`ssh`, `http`, `mysql` 등)
 - **버전/제품 탐지** — 배너에서 OpenSSH, nginx, IIS, FortiOS 등 추출
-- **OS 추정** — 시스템 ping 의 **TTL 값**(64/128/255)과 배너 근거로 계열 추정
+- **호스트 식별 (TTL 이외 다중 신호)** — 아래 여러 방법을 조합해 "무슨 호스트/OS"인지 판별
+  - **TTL 분석** — ping 의 TTL(64=Linux / 128=Windows / 255=네트워크 장비)
+  - **NetBIOS 조회(UDP 137)** — 실제 **컴퓨터 이름 + 워크그룹/도메인 + MAC 주소** (Windows·SMB 장비)
+  - **SNMP sysDescr(UDP 161, community `public`)** — 장비 **모델·OS 전체 설명** (FortiGate·Cisco·프린터 등)
+  - **배너 근거** — Server 헤더, OpenSSH/IIS 등 제품 문자열
 - **호스트 정보** — 정방향/역방향 DNS, 도달 여부, 응답시간(RTT)
+- **포트 위험도 DB 213개** — IANA well-known(0–1023) 전반 + 주요 registered 포트
+  (DB·원격접속·OT/ICS(Modbus/S7/BACnet)·백도어 포트까지 위험도·권고 포함)
 - **nmap 형식 출력** — HTML 도구 ⑦ 탭에 그대로 붙여넣기 가능
 - **결과 저장** — 리포트 + nmap 블록을 `.txt` 로 저장
+
+> NetBIOS/SNMP 는 대상이 해당 서비스를 열어둔 경우에만 응답합니다(주로 사내망 LAN).
+> 인터넷 너머의 호스트나 UDP 137/161 이 차단된 경우에는 표시되지 않을 수 있습니다.
 
 ## 사용법
 

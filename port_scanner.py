@@ -195,6 +195,166 @@ def guess_os_from_ttl(ttl):
 
 
 # ---------------------------------------------------------------------------
+# 추가 호스트 식별 (TTL 이외) - NetBIOS / SNMP
+# ---------------------------------------------------------------------------
+def netbios_query(ip, timeout=2.0):
+    """NetBIOS 이름 서비스(UDP 137) 질의로 컴퓨터 이름/그룹/MAC 을 얻는다.
+
+    Windows 및 SMB 지원 장비에서 실제 호스트명과 워크그룹/도메인, MAC 주소를
+    확인할 수 있다 (nbtstat -A 와 유사).
+    """
+    # NBSTAT(노드 상태) 질의: 이름 "*" 를 First-Level 인코딩
+    #   '*'(0x2A) -> 'CK', 0x00 15개 -> 'AA'*15
+    encoded = b"CK" + b"AA" * 15
+    tid = b"\x13\x37"
+    pkt = (tid + b"\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00" +
+           b"\x20" + encoded + b"\x00" +
+           b"\x00\x21" + b"\x00\x01")  # type=NBSTAT(0x21), class=IN(0x01)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(pkt, (ip, 137))
+        data, _ = sock.recvfrom(2048)
+    except Exception:
+        return None
+    finally:
+        sock.close()
+
+    try:
+        # 헤더(12) + 질의 이름(34: 0x20 + 32 + 0x00) + type(2) + class(2)
+        # + ttl(4) + rdlength(2) = 12 + 34 + 10 = 56, 이후 rdata
+        idx = 56
+        if len(data) < idx + 1:
+            return None
+        num = data[idx]
+        idx += 1
+        names = []
+        workstation = None
+        group = None
+        for _ in range(num):
+            if len(data) < idx + 18:
+                break
+            raw = data[idx:idx + 15].split(b"\x00")[0]
+            name = raw.decode("ascii", errors="replace").strip()
+            suffix = data[idx + 15]
+            flags = data[idx + 16] << 8 | data[idx + 17]
+            is_group = bool(flags & 0x8000)
+            idx += 18
+            if not name:
+                continue
+            names.append({"name": name, "suffix": suffix, "group": is_group})
+            if suffix == 0x00 and not is_group and workstation is None:
+                workstation = name
+            if is_group and group is None:
+                group = name
+        # 노드 통계의 첫 6바이트가 MAC 주소
+        mac = None
+        if len(data) >= idx + 6:
+            macbytes = data[idx:idx + 6]
+            if macbytes != b"\x00" * 6:
+                mac = ":".join("%02X" % b for b in macbytes)
+        if not workstation and not group and not mac:
+            return None
+        return {"name": workstation, "group": group, "mac": mac,
+                "names": names}
+    except Exception:
+        return None
+
+
+def _ber_len(n):
+    if n < 0x80:
+        return bytes([n])
+    out = []
+    while n:
+        out.insert(0, n & 0xFF)
+        n >>= 8
+    return bytes([0x80 | len(out)]) + bytes(out)
+
+
+def _ber_tlv(tag, value):
+    return bytes([tag]) + _ber_len(len(value)) + value
+
+
+def snmp_sysdescr(ip, timeout=2.0, community="public"):
+    """SNMPv1 GET 으로 sysDescr.0 / sysName.0 을 조회한다 (UDP 161).
+
+    네트워크 장비(FortiGate, Cisco, 프린터 등)의 모델·OS 전체 설명을 확인.
+    기본 community 'public' 이 열려 있는 경우에만 응답한다.
+    """
+    # OID 인코딩: 1.3.6.1.2.1.1.1.0 (sysDescr.0)
+    oid = bytes([0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00])
+    varbind = _ber_tlv(0x30, _ber_tlv(0x06, oid) + _ber_tlv(0x05, b""))
+    varbinds = _ber_tlv(0x30, varbind)
+    pdu_body = (_ber_tlv(0x02, b"\x2a") +      # request-id = 42
+                _ber_tlv(0x02, b"\x00") +      # error-status
+                _ber_tlv(0x02, b"\x00") +      # error-index
+                varbinds)
+    pdu = _ber_tlv(0xA0, pdu_body)             # GetRequest
+    msg = _ber_tlv(0x30,
+                   _ber_tlv(0x02, b"\x00") +   # version = 0 (v1)
+                   _ber_tlv(0x04, community.encode()) +
+                   pdu)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(msg, (ip, 161))
+        data, _ = sock.recvfrom(4096)
+    except Exception:
+        return None
+    finally:
+        sock.close()
+
+    # 응답에서 sysDescr OID 뒤의 값을 추출
+    try:
+        pos = data.find(oid)
+        if pos < 0:
+            return None
+        i = pos + len(oid)
+        if i >= len(data):
+            return None
+        tag = data[i]
+        i += 1
+        # 길이 파싱
+        length = data[i]
+        i += 1
+        if length & 0x80:
+            nbytes = length & 0x7F
+            length = int.from_bytes(data[i:i + nbytes], "big")
+            i += nbytes
+        value = data[i:i + length]
+        if tag == 0x04:  # OCTET STRING
+            text = value.decode("utf-8", errors="replace").strip()
+            text = re.sub(r"\s+", " ", text)
+            return text[:250] or None
+    except Exception:
+        return None
+    return None
+
+
+def recon_host(ip, timeout=2.0):
+    """TTL 이외의 신호로 호스트를 식별한다 (NetBIOS + SNMP, 병렬)."""
+    info = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f_nb = ex.submit(netbios_query, ip, timeout)
+        f_sd = ex.submit(snmp_sysdescr, ip, timeout)
+        try:
+            nb = f_nb.result()
+            if nb:
+                info["netbios"] = nb
+        except Exception:
+            pass
+        try:
+            sd = f_sd.result()
+            if sd:
+                info["snmp"] = sd
+        except Exception:
+            pass
+    return info
+
+
+# ---------------------------------------------------------------------------
 # 포트 스캔 (TCP connect)
 # ---------------------------------------------------------------------------
 def scan_port(ip, port, timeout):
@@ -333,13 +493,15 @@ def fingerprint_product(banner):
     return ", ".join(hits)
 
 
-def refine_os_from_banners(os_guess, open_ports):
-    """수집한 배너로 OS 추정을 보강한다."""
+def refine_os_from_banners(os_guess, open_ports, recon=None):
+    """수집한 배너 + NetBIOS/SNMP 정찰로 OS 추정을 보강한다."""
     hints = []
+    blob_all = ""
     for info in open_ports:
         b = (info.get("banner") or "").lower()
         prod = (info.get("product") or "").lower()
         blob = b + " " + prod
+        blob_all += " " + blob
         if "windows" in blob or "microsoft-iis" in blob or "microsoft-ds" == info.get("service"):
             hints.append("Windows")
         if "ubuntu" in blob:
@@ -352,12 +514,32 @@ def refine_os_from_banners(os_guess, open_ports):
             hints.append("Fortinet FortiOS")
         if "cisco" in blob:
             hints.append("Cisco IOS/장비")
+        if "mikrotik" in blob or "routeros" in blob:
+            hints.append("MikroTik RouterOS")
         if "openssh" in blob and "windows" not in blob:
             hints.append("Linux/Unix (OpenSSH)")
     # netbios/smb 포트로 Windows 강력 추정
     ports = {p["port"] for p in open_ports}
     if {135, 139, 445} & ports or 3389 in ports or 5985 in ports:
         hints.append("Windows (SMB/RDP/WinRM 포트 감지)")
+
+    # SNMP sysDescr 는 가장 신뢰도 높은 근거
+    if recon and recon.get("snmp"):
+        sd = recon["snmp"].lower()
+        if "windows" in sd:
+            hints.append("Windows (SNMP)")
+        elif "linux" in sd:
+            hints.append("Linux (SNMP)")
+        elif "fortigate" in sd or "fortios" in sd:
+            hints.append("Fortinet FortiOS (SNMP)")
+        elif "cisco" in sd or "ios" in sd:
+            hints.append("Cisco (SNMP)")
+        elif "juniper" in sd or "junos" in sd:
+            hints.append("Juniper JunOS (SNMP)")
+        else:
+            hints.append("SNMP: " + recon["snmp"][:60])
+    if recon and recon.get("netbios"):
+        hints.append("Windows/SMB (NetBIOS 응답)")
 
     uniq = []
     for h in hints:
@@ -367,7 +549,7 @@ def refine_os_from_banners(os_guess, open_ports):
     if os_guess:
         parts.append(os_guess)
     if uniq:
-        parts.append("배너 근거: " + "; ".join(uniq))
+        parts.append("근거: " + "; ".join(uniq))
     return " | ".join(parts) if parts else "판별 불가"
 
 
@@ -459,11 +641,19 @@ def build_report(ip, meta, open_infos, scanned_count, elapsed):
     if meta.get("forward_name"):
         lines.append(" 입력 호스트명  : %s" % meta["forward_name"])
     lines.append(" 역방향 DNS     : %s" % (meta.get("rdns") or "-"))
+    if meta.get("netbios_name"):
+        lines.append(" NetBIOS 이름   : %s" % meta["netbios_name"])
+    if meta.get("netbios_group"):
+        lines.append(" 워크그룹/도메인: %s" % meta["netbios_group"])
+    if meta.get("mac"):
+        lines.append(" MAC 주소       : %s" % meta["mac"])
     lines.append(" 도달 여부      : %s" % ("응답함" if meta.get("reachable") else "무응답(ICMP 차단 가능)"))
     if meta.get("ttl") is not None:
         lines.append(" 관측 TTL       : %s" % meta["ttl"])
     if meta.get("rtt") is not None:
         lines.append(" 평균 응답시간  : %.1f ms" % meta["rtt"])
+    if meta.get("snmp"):
+        lines.append(" SNMP sysDescr  : %s" % meta["snmp"])
     lines.append(" 추정 OS        : %s" % meta.get("os", "판별 불가"))
     lines.append(" 스캔 포트 수   : %d" % scanned_count)
     lines.append(" 열린 포트 수   : %d" % len(open_infos))
@@ -527,6 +717,12 @@ def scan_target(target, port_spec, timeout, workers, quiet=False):
             len(ports), timeout, workers) + C.END)
 
     start = time.time()
+
+    # TTL 이외의 호스트 식별 (NetBIOS/SNMP) — 포트 스캔과 병행
+    if not quiet:
+        print(C.B + "[*] 호스트 식별 정찰 (NetBIOS/SNMP)..." + C.END)
+    recon = recon_host(ip, timeout=2.0)
+
     open_ports = run_scan(ip, ports, timeout, workers,
                           on_progress=None if quiet else print_progress)
 
@@ -544,11 +740,16 @@ def scan_target(target, port_spec, timeout, workers, quiet=False):
         })
 
     elapsed = time.time() - start
-    os_final = refine_os_from_banners(os_guess, open_infos)
+    os_final = refine_os_from_banners(os_guess, open_infos, recon)
 
+    nb = recon.get("netbios") or {}
     meta = {
         "ip": ip, "forward_name": forward_name, "rdns": rdns,
         "reachable": reachable, "ttl": ttl, "rtt": rtt, "os": os_final,
+        "netbios_name": nb.get("name"),
+        "netbios_group": nb.get("group"),
+        "mac": nb.get("mac"),
+        "snmp": recon.get("snmp"),
     }
     return {
         "meta": meta, "open": open_infos,
@@ -581,6 +782,10 @@ def result_to_dict(result):
         "target": m.get("forward_name") or m["ip"],
         "ip": m["ip"],
         "rdns": m.get("rdns"),
+        "netbiosName": m.get("netbios_name"),
+        "netbiosGroup": m.get("netbios_group"),
+        "mac": m.get("mac"),
+        "snmp": m.get("snmp"),
         "reachable": m.get("reachable"),
         "ttl": m.get("ttl"),
         "rtt": m.get("rtt"),
