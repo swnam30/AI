@@ -21,6 +21,7 @@ import ipaddress
 import json
 import platform
 import re
+import selectors
 import socket
 import subprocess
 import sys
@@ -28,6 +29,21 @@ import threading
 import time
 import uuid
 from datetime import datetime
+
+
+def _raise_fd_limit():
+    """대역 스윕 시 동시 소켓 수가 많아지므로 파일 디스크립터 한도를 최대로 올린다."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        return resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except Exception:
+        return None
+
+
+_FD_SOFT_LIMIT = _raise_fd_limit()   # None on Windows
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -611,8 +627,13 @@ def parse_ports(spec):
 # 네트워크 대역 스윕 (Host Discovery) - IP 충돌 예방용
 # ---------------------------------------------------------------------------
 SWEEP_MAX_HOSTS = 8192   # 한 번에 스윕 가능한 최대 호스트 수 (/19)
-# 존재 여부 판별에 쓰는 소수 정예 포트 (open 또는 refused 응답이면 호스트 존재)
-SWEEP_PROBE_PORTS = [445, 139, 135, 80, 443, 22, 3389, 62078]
+# 존재 여부 판별용 프로브 포트 (open 또는 refused 응답이면 호스트 존재).
+# 서버·네트워크장비·IP전화(SIP 5060)·프린터·CCTV 등 실제 장비가 흔히 여는 포트를 포함.
+SWEEP_PROBE_PORTS = [
+    21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 554, 993, 995,
+    1720, 1723, 2000, 3306, 3389, 5000, 5060, 5061, 7547, 8000, 8080,
+    8443, 8888, 9100, 62078,
+]
 _REFUSED = {errno.ECONNREFUSED, 10061}   # Linux/Windows 연결거부 코드
 
 
@@ -683,11 +704,15 @@ def read_arp_table():
     return table
 
 
-def _probe_alive(ip, timeout):
-    """단일 IP 존재 여부를 TCP(open/refused)로 판별하고 ARP 해석을 유도한다."""
-    alive = False
-    methods = []
+def _probe_alive(ip, timeout, ports=None):
+    """단일 IP 존재 여부를 TCP(open/refused)로 판별하고 ARP 해석을 유도한다.
+
+    여러 포트를 논블로킹 소켓 + selectors 로 '동시에' 검사하므로, 포트 수가
+    많아도 소요 시간은 타임아웃 1회 수준으로 유지된다.
+    """
+    ports = ports or SWEEP_PROBE_PORTS
     open_ports = []
+    refused = False
     # UDP nudge: 즉시 반환되며 OS 가 대상 MAC 을 ARP 로 해석하게 만든다
     try:
         u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -695,37 +720,95 @@ def _probe_alive(ip, timeout):
         u.close()
     except Exception:
         pass
-    for p in SWEEP_PROBE_PORTS:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        try:
-            r = s.connect_ex((ip, p))
-            if r == 0:
-                alive = True
-                open_ports.append(p)
-                if "TCP" not in methods:
-                    methods.append("TCP")
-            elif r in _REFUSED:
-                alive = True
-                if "TCP(refused)" not in methods:
-                    methods.append("TCP(refused)")
-        except Exception:
-            pass
-        finally:
-            s.close()
-        if alive and open_ports:
-            break  # 열린 포트 하나 찾으면 조기 종료(속도)
-    return ip, alive, methods, open_ports
+
+    sel = selectors.DefaultSelector()
+    socks = {}
+    try:
+        for p in ports:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setblocking(False)
+                rc = s.connect_ex((ip, p))
+                if rc == 0:
+                    open_ports.append(p)
+                    s.close()
+                    continue
+                # EINPROGRESS/EWOULDBLOCK 등 → 연결 진행 중
+                sel.register(s, selectors.EVENT_WRITE, p)
+                socks[s] = p
+            except Exception:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        deadline = time.time() + timeout
+        pending = set(socks)
+        while pending:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            events = sel.select(timeout=remaining)
+            if not events:
+                break
+            for key, _ in events:
+                s = key.fileobj
+                p = key.data
+                err = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if err == 0:
+                    open_ports.append(p)
+                elif err in _REFUSED:
+                    refused = True
+                try:
+                    sel.unregister(s)
+                    s.close()
+                except Exception:
+                    pass
+                pending.discard(s)
+        # 타임아웃까지 무응답 = filtered (열림/거부 아님)
+        for s in pending:
+            try:
+                sel.unregister(s)
+                s.close()
+            except Exception:
+                pass
+    finally:
+        sel.close()
+
+    methods = []
+    if open_ports:
+        methods.append("TCP")
+    if refused and not open_ports:
+        methods.append("TCP(refused)")
+    alive = bool(open_ports) or refused
+    return ip, alive, methods, sorted(open_ports)
 
 
-def sweep_network(spec, timeout=0.4, workers=100, do_ping=True,
-                  identify=True, on_progress=None):
+def sweep_probe_ports(deep=False):
+    """스윕 프로브 포트 목록. deep=True 면 전체 TOP_PORTS 로 정밀 검사."""
+    if deep:
+        return sorted(set(TOP_PORTS) | set(SWEEP_PROBE_PORTS))
+    return SWEEP_PROBE_PORTS
+
+
+def _safe_workers(requested, nports):
+    """동시 소켓 수(workers*nports)가 FD 한도를 넘지 않도록 워커 수를 조정한다."""
+    budget = 3000  # Windows 등 한도 정보 없을 때 기본 예산
+    if _FD_SOFT_LIMIT:
+        budget = max(256, int(_FD_SOFT_LIMIT * 0.7))
+    cap = max(8, budget // max(1, nports))
+    return max(1, min(requested, cap))
+
+
+def sweep_network(spec, timeout=0.6, workers=100, do_ping=True,
+                  identify=True, on_progress=None, deep=False):
     """네트워크 대역을 스윕해 점유(used)/미사용(free) IP 를 판별한다."""
     hosts = parse_hosts(spec)
     if len(hosts) > SWEEP_MAX_HOSTS:
         raise ValueError("대상 호스트가 %d개로 너무 많습니다 (최대 %d, 약 /19). "
                          "범위를 좁혀주세요." % (len(hosts), SWEEP_MAX_HOSTS))
 
+    ports = sweep_probe_ports(deep)
+    workers = _safe_workers(workers, len(ports))
     start = time.time()
     total = len(hosts)
     done = 0
@@ -733,7 +816,7 @@ def sweep_network(spec, timeout=0.4, workers=100, do_ping=True,
 
     # 1단계: TCP 프로브 + ARP 유도 (병렬)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_probe_alive, ip, timeout): ip for ip in hosts}
+        futs = {ex.submit(_probe_alive, ip, timeout, ports): ip for ip in hosts}
         for fut in concurrent.futures.as_completed(futs):
             done += 1
             if on_progress:
@@ -839,13 +922,16 @@ def _prune_sweep_jobs(max_age=900):
             _SWEEP_JOBS.pop(jid, None)
 
 
-def sweep_start(spec, timeout=0.4, workers=100, do_ping=True, identify=True):
+def sweep_start(spec, timeout=0.6, workers=100, do_ping=True, identify=True,
+                deep=False):
     """진행형 스윕 작업을 시작하고 (job_id, hosts) 를 반환한다.
     백그라운드 스레드가 결과를 채우며, sweep_snapshot 으로 진행 상황을 조회."""
     hosts = parse_hosts(spec)
     if len(hosts) > SWEEP_MAX_HOSTS:
         raise ValueError("대상 호스트가 %d개로 너무 많습니다 (최대 %d, 약 /19). "
                          "범위를 좁혀주세요." % (len(hosts), SWEEP_MAX_HOSTS))
+    ports = sweep_probe_ports(deep)
+    workers = _safe_workers(workers, len(ports))
     jid = uuid.uuid4().hex[:12]
     job = {
         "id": jid, "network": spec, "created": time.time(),
@@ -859,19 +945,20 @@ def sweep_start(spec, timeout=0.4, workers=100, do_ping=True, identify=True):
         _prune_sweep_jobs()
         _SWEEP_JOBS[jid] = job
     t = threading.Thread(target=_run_sweep_job,
-                         args=(job, timeout, workers, do_ping, identify),
+                         args=(job, timeout, workers, do_ping, identify, ports),
                          daemon=True)
     t.start()
     return jid, hosts
 
 
-def _run_sweep_job(job, timeout, workers, do_ping, identify):
+def _run_sweep_job(job, timeout, workers, do_ping, identify, ports=None):
     hosts = job["hosts"]
     state = job["state"]
+    ports = ports or SWEEP_PROBE_PORTS
     try:
         # 1단계: TCP 프로브 (완료 즉시 점유 표시)
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(_probe_alive, ip, timeout): ip for ip in hosts}
+            futs = {ex.submit(_probe_alive, ip, timeout, ports): ip for ip in hosts}
             for fut in concurrent.futures.as_completed(futs):
                 ip, alive, methods, openp = fut.result()
                 with _SWEEP_LOCK:
@@ -1295,15 +1382,16 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                            status=400)
                 return
             try:
-                timeout = float(q("timeout", "0.4"))
+                timeout = float(q("timeout", "0.6"))
                 workers = int(q("workers", "100"))
             except ValueError:
-                timeout, workers = 0.4, 100
+                timeout, workers = 0.6, 100
             do_ping = q("ping", "1") not in ("0", "false", "no")
+            deep = q("deep", "0") in ("1", "true", "yes")
             print("  [브리지] 대역 스윕 요청: %s" % cidr)
             try:
                 res = sweep_network(cidr, timeout=timeout, workers=workers,
-                                    do_ping=do_ping)
+                                    do_ping=do_ping, deep=deep)
             except ValueError as e:
                 self._json({"ok": False, "error": str(e)}, status=400)
                 return
@@ -1323,15 +1411,16 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                            status=400)
                 return
             try:
-                timeout = float(q("timeout", "0.4"))
+                timeout = float(q("timeout", "0.6"))
                 workers = int(q("workers", "100"))
             except ValueError:
-                timeout, workers = 0.4, 100
+                timeout, workers = 0.6, 100
             do_ping = q("ping", "1") not in ("0", "false", "no")
-            print("  [브리지] 대역 스윕 시작: %s" % cidr)
+            deep = q("deep", "0") in ("1", "true", "yes")
+            print("  [브리지] 대역 스윕 시작: %s (정밀=%s)" % (cidr, deep))
             try:
                 jid, hosts = sweep_start(cidr, timeout=timeout, workers=workers,
-                                         do_ping=do_ping)
+                                         do_ping=do_ping, deep=deep)
             except ValueError as e:
                 self._json({"ok": False, "error": str(e)}, status=400)
                 return
@@ -1456,7 +1545,11 @@ def sweep_menu():
         if not spec:
             continue
         try:
-            res = run_sweep(spec, quiet=False)
+            dp = input(C.W + "  정밀 스캔(전체 포트로 존재 판별, 느림)? (y/N) > " + C.END).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            dp = "n"
+        try:
+            res = run_sweep(spec, quiet=False, deep=(dp == "y"))
         except ValueError as e:
             print(C.R + "  [!] %s" % e + C.END)
             continue
@@ -1479,14 +1572,16 @@ def sweep_menu():
         print()
 
 
-def run_sweep(spec, timeout=0.4, workers=100, do_ping=True, quiet=False):
+def run_sweep(spec, timeout=0.6, workers=100, do_ping=True, quiet=False,
+              deep=False):
     """대역 스윕을 실행하고 결과 딕셔너리를 반환한다 (콘솔 진행표시 포함)."""
     if not quiet:
         hosts = parse_hosts(spec)
         print(C.B + "[*] 대상 대역: %s  (호스트 %d개)" % (spec, len(hosts)) + C.END)
-        print(C.B + "[*] 스윕 시작 (TCP 프로브 + ARP + ICMP)..." + C.END)
+        print(C.B + "[*] 스윕 시작 (TCP 프로브 %d포트 + ARP + ICMP)%s..." % (
+            len(sweep_probe_ports(deep)), " [정밀]" if deep else "") + C.END)
     res = sweep_network(spec, timeout=timeout, workers=workers, do_ping=do_ping,
-                        on_progress=None if quiet else print_progress)
+                        on_progress=None if quiet else print_progress, deep=deep)
     return res
 
 
@@ -1564,6 +1659,8 @@ def main():
                              "(예: 192.168.10.0/24, 10.0.0.1-100)")
     parser.add_argument("--no-ping", action="store_true",
                         help="대역 스윕 시 ICMP ping 단계 생략")
+    parser.add_argument("--deep", action="store_true",
+                        help="대역 스윕 정밀 모드: 전체 주요 포트로 존재 여부 판별")
     parser.add_argument("--serve", action="store_true",
                         help="HTML 연동 브리지 서버 모드로 실행")
     parser.add_argument("--serve-host", default="127.0.0.1",
@@ -1588,9 +1685,10 @@ def main():
 
     if args.sweep:
         try:
-            res = run_sweep(args.sweep, timeout=max(args.timeout * 0.4, 0.3),
+            res = run_sweep(args.sweep, timeout=max(args.timeout * 0.6, 0.4),
                             workers=min(args.workers, 150),
-                            do_ping=not args.no_ping, quiet=args.quiet)
+                            do_ping=not args.no_ping, quiet=args.quiet,
+                            deep=args.deep)
         except ValueError as e:
             print(C.R + "[!] %s" % e + C.END)
             sys.exit(1)

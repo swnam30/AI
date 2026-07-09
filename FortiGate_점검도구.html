@@ -861,6 +861,9 @@ th.th-dst-intf { background: #dcfce7; color: #14532d; }
         <label style="font-size:12px;color:#555;display:flex;align-items:center;gap:4px">
           <input id="paSweepPing" type="checkbox" checked> ICMP 포함
         </label>
+        <label style="font-size:12px;color:#555;display:flex;align-items:center;gap:4px" title="전체 주요 포트(74개)로 존재 여부를 판별합니다. 방화벽 뒤 장비 탐지율이 높아지지만 느립니다.">
+          <input id="paSweepDeep" type="checkbox"> 정밀
+        </label>
         <button class="btn btn-primary" onclick="paSweepScan()" id="paSweepBtn" style="background:#00695c">🌐 대역 스캔</button>
       </div>
       <div id="paSweepSummary" style="display:none;margin-top:10px;font-size:13px;font-weight:bold"></div>
@@ -5216,6 +5219,7 @@ function paSweepScan() {
   var cidr = (document.getElementById('paSweepCidr').value || '').trim();
   if (!cidr) { alert('스캔할 대역을 입력하세요. (예: 192.168.10.0/24)'); return; }
   var ping = document.getElementById('paSweepPing').checked ? '1' : '0';
+  var deep = document.getElementById('paSweepDeep').checked ? '1' : '0';
 
   if (_paSweepPoll) { clearInterval(_paSweepPoll); _paSweepPoll = null; }
   var btn = document.getElementById('paSweepBtn');
@@ -5224,7 +5228,7 @@ function paSweepScan() {
   document.getElementById('paSweepResult').style.display = 'none';
   document.getElementById('paSweepFree').style.display = 'none';
 
-  var url = paBridgeBase() + '/sweep_start?cidr=' + encodeURIComponent(cidr) + '&ping=' + ping;
+  var url = paBridgeBase() + '/sweep_start?cidr=' + encodeURIComponent(cidr) + '&ping=' + ping + '&deep=' + deep;
   fetch(url, {cache:'no-store'})
     .then(function(r){ return r.json().then(function(j){ return {status:r.status, body:j}; }); })
     .then(function(res){
