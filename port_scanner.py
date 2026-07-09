@@ -799,6 +799,24 @@ def _safe_workers(requested, nports):
     return max(1, min(requested, cap))
 
 
+def detect_phantom_ports(open_map, total):
+    """중계장비(SIP ALG, 투명 프록시 등)가 '모든 IP'에 대해 응답하여 특정 포트가
+    대다수 호스트에서 열린 것처럼 보이는 경우를 탐지한다.
+
+    open_map: {ip: [열린 포트,...]}, total: 전체 스캔 호스트 수.
+    반환: 팬텀(오탐) 포트 집합. 정상 서비스 포트는 소수 호스트에서만 열리므로,
+    전체의 40% 이상(또는 다수)에서 열린 포트는 네트워크 장비 오탐으로 간주한다.
+    """
+    if total < 16:
+        return set()   # 소규모 범위(특정 호스트 지정)는 필터하지 않음
+    counts = {}
+    for ports in open_map.values():
+        for p in ports:
+            counts[p] = counts.get(p, 0) + 1
+    threshold = max(8, int(total * 0.4))
+    return {p for p, c in counts.items() if c >= threshold}
+
+
 def sweep_network(spec, timeout=0.6, workers=100, do_ping=True,
                   identify=True, on_progress=None, deep=False):
     """네트워크 대역을 스윕해 점유(used)/미사용(free) IP 를 판별한다."""
@@ -824,6 +842,18 @@ def sweep_network(spec, timeout=0.6, workers=100, do_ping=True,
             ip, alive, methods, openp = fut.result()
             if alive:
                 alive_map[ip] = {"methods": list(methods), "open_ports": openp}
+
+    # 1.5단계: 팬텀 포트 보정 — 중계장비가 모든 IP 에 응답하는 포트 제외
+    phantom = detect_phantom_ports(
+        {ip: e["open_ports"] for ip, e in alive_map.items()}, total)
+    if phantom:
+        for ip in list(alive_map):
+            e = alive_map[ip]
+            real_open = [p for p in e["open_ports"] if p not in phantom]
+            has_refused = any("refused" in m for m in e["methods"])
+            e["open_ports"] = real_open
+            if not real_open and not has_refused:
+                del alive_map[ip]   # 팬텀 포트만으로 잡혔던 IP 제거
 
     # 2단계: ICMP ping (아직 미확인 호스트만, 병렬) — ICMP만 응답하는 호스트 포착
     if do_ping:
@@ -883,6 +913,7 @@ def sweep_network(spec, timeout=0.6, workers=100, do_ping=True,
         "usedCount": len(used),
         "free": free,
         "freeCount": len(free),
+        "phantomPorts": sorted(phantom) if phantom else None,
         "elapsed": round(time.time() - start, 2),
     }
 
@@ -967,6 +998,26 @@ def _run_sweep_job(job, timeout, workers, do_ping, identify, ports=None):
                         state[ip]["status"] = "used"
                         state[ip]["methods"] = list(methods)
                         state[ip]["open_ports"] = openp
+
+        # 1.5단계: 팬텀 포트 보정 — 중계장비가 모든 IP 에 응답하는 포트 제외
+        job["phase"] = "calibrate"
+        open_map = {ip: state[ip]["open_ports"] for ip in hosts
+                    if state[ip]["status"] == "used"}
+        phantom = detect_phantom_ports(open_map, len(hosts))
+        if phantom:
+            job["phantom_ports"] = sorted(phantom)
+            with _SWEEP_LOCK:
+                for ip in hosts:
+                    st = state[ip]
+                    if st["status"] != "used":
+                        continue
+                    real_open = [p for p in st["open_ports"] if p not in phantom]
+                    has_refused = any("refused" in m for m in st["methods"])
+                    st["open_ports"] = real_open
+                    if not real_open and not has_refused:
+                        # 팬텀 포트만으로 점유로 잡혔던 IP → 미확정으로 되돌림
+                        st["status"] = "scanning"
+                        st["methods"] = []
 
         # 2단계: ICMP (미확인 호스트만)
         if do_ping:
@@ -1070,6 +1121,7 @@ def sweep_snapshot(job_id, offset=0):
             "usedCount": used, "freeCount": free,
             "hosts": hosts_out,
             "elapsed": job.get("elapsed"),
+            "phantomPorts": job.get("phantom_ports"),
             "error": job.get("error"),
         }
         return snap
@@ -1113,6 +1165,10 @@ def build_sweep_report(res):
     lines.append(" 전체 호스트 : %d개    점유(사용중): %d개    미사용(비어있음): %d개" % (
         res["total"], res["usedCount"], res["freeCount"]))
     lines.append(" 소요 시간   : %.1f 초" % res["elapsed"])
+    if res.get("phantomPorts"):
+        lines.append(" ⚠ 오탐 제외  : 포트 %s 은(는) 네트워크 중계장비(SIP ALG 등)가"
+                     % ", ".join(str(p) for p in res["phantomPorts"]))
+        lines.append("               모든 IP 에 응답해 존재 판별에서 제외했습니다.")
     lines.append("-" * 72)
     if res["used"]:
         lines.append(" [ 점유 중인 IP — 이 주소는 이미 사용 중이므로 배정 금지 ]")
