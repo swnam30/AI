@@ -1,0 +1,60 @@
+# 📋 프로젝트 인수인계 요약 (새 세션용)
+
+> 새 세션에서 이 파일을 열어보면 바로 이어서 작업할 수 있습니다.
+> **다음 할 일: 어느 탭을 어떻게 수정할지 사용자에게 확인 → 진행.**
+
+## 개요
+FortiGate 방화벽 점검용 **단일 HTML 도구**를 개발 중. 이번엔 **다른 탭 기능을 수정**하려고 함.
+
+## 저장소 / 브랜치
+- **Repo:** `swnam30/ai` (GitHub)
+- **작업 브랜치:** `claude/port-scanner-exe-b25kju` (이 브랜치에서 계속 작업/커밋/푸시)
+- GitHub 작업은 `gh` CLI 없음 → **GitHub MCP 툴**(`mcp__github__*`) 사용
+
+## 파일 구성
+```
+FortiGate_점검도구.html   ← 메인 (단일 HTML 도구, ~5500줄). <script> 시작: 약 937줄
+port_scanner.py           ← ⑦탭 연동용 포트 스캐너 (별도 exe)
+.github/workflows/build-exe.yml  ← Windows exe 자동 빌드(CI)
+build.bat / start-bridge.bat / register-protocol.bat
+README.md / .gitignore / HANDOFF.md(이 파일)
+```
+
+## HTML 탭 구조 (`switchTab(name)` 함수, 배열 정의 약 1053줄)
+| 탭 | name | 패널 id | 위치(대략) | 상태 |
+|---|---|---|---|---|
+| ① 민감정보 치환 | `anonymize` | `tab-anonymize` | 262 | 완성 |
+| ② 정책 뷰어 | `viewer` | `tab-viewer` | 306 | 완성 |
+| ③ Event Log 분석 | `log` | `tab-log` | 358 | 완성 |
+| ④ 점검보고서 | `report` | `tab-report` | 461 | 개발중 |
+| ⑤ Config 변환 | `convert` | `tab-convert` | 666 | 개발중 |
+| ⑥ 멀티벤더 뷰어 | `multivendor` | `tab-multivendor` | 761 | 개발중 |
+| ⑦ 포트 분석 | `portanalysis` | `tab-portanalysis` | 803 | 완료 |
+
+- 탭 헤더(클릭 UI): 약 252~258줄
+- 탭 추가/변경 시 `switchTab`의 `names` 배열(~1053)·`panels` 배열(~1057)도 같이 수정
+- 줄 번호는 편집에 따라 변하므로 `grep`으로 앵커를 다시 확인할 것
+
+## 지난 세션에서 완료한 것 (⑦ 포트 분석 탭 — 참고용, 이미 완료)
+- `port_scanner.py`(exe)와 HTML을 **로컬 브리지 서버**(`--serve`, 기본 `127.0.0.1:8765`)로 연동.
+  HTML `fetch` → exe 스캔 → 결과 표시. (브라우저는 로컬 프로그램 직접 실행 불가하므로 이 구조)
+- 브리지 엔드포인트: `/health`, `/scan`, `/sweep`, `/sweep_start`, `/sweep_status` (CORS + PNA 헤더)
+- 기능: 단일 포트 스캔(nmap 유사, TCP connect), 포트 위험도 DB 213개(`PA_DB`),
+  호스트 식별(TTL·NetBIOS(UDP137)·SNMP(UDP161)·배너), **대역 스윕**(사용중/빈 IP 판별,
+  실시간 격자+폴링, 팬텀포트 오탐 자동 제외).
+- exe는 **GitHub Actions(windows-latest)**에서 빌드 → Actions 탭 Artifacts `PortScanner-windows-exe`.
+  (러너 배정이 큐에서 지연될 수 있음 — 실패 시 Re-run. 워크플로에 timeout-minutes 설정됨)
+
+## ⚠️ 작업 규칙
+- **HTML 파일이 실제 산출물** → 수정 후 `SendUserFile`로 사용자에게 파일 전달.
+- HTML 수정 후 **Chromium(Playwright)로 `file://` e2e 검증** 흐름 유지:
+  - `pip install playwright` (python), 브라우저: `/opt/pw-browsers/chromium-1194/chrome-linux/chrome`
+  - `p.chromium.launch(executable_path=...)` 로 페이지 로드 → `switchTab(...)` → 기능 확인, `pageerror` 수집
+- 커밋 메시지에 모델 식별자 넣지 말 것. 끝에 `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>` 유지.
+- 푸시: `git push -u origin claude/port-scanner-exe-b25kju` (네트워크 실패 시 지수백오프 재시도).
+- PR은 사용자가 명시적으로 요청할 때만 생성.
+- HTML 편집 시: `<!DOCTYPE>`/`<head>` 등 기존 구조 유지, ID 충돌 주의, 전역 변수/함수는 `<script>`(937줄~) 내에 추가.
+
+## 다음 작업
+**수정할 탭과 원하는 변경 내용을 사용자에게 확인한 뒤 진행.**
+(예: "④ 점검보고서 탭에 ~~ 기능 추가", "② 정책 뷰어에서 ~~ 수정")
