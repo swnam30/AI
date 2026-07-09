@@ -24,7 +24,9 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
+import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -824,6 +826,169 @@ def summarize_free(free):
 
 
 # ---------------------------------------------------------------------------
+# 진행형 대역 스윕 (job + 폴링) - HTML 실시간 표시용
+# ---------------------------------------------------------------------------
+_SWEEP_JOBS = {}
+_SWEEP_LOCK = threading.Lock()
+
+
+def _prune_sweep_jobs(max_age=900):
+    now = time.time()
+    for jid in list(_SWEEP_JOBS):
+        if now - _SWEEP_JOBS[jid].get("created", now) > max_age:
+            _SWEEP_JOBS.pop(jid, None)
+
+
+def sweep_start(spec, timeout=0.4, workers=100, do_ping=True, identify=True):
+    """진행형 스윕 작업을 시작하고 (job_id, hosts) 를 반환한다.
+    백그라운드 스레드가 결과를 채우며, sweep_snapshot 으로 진행 상황을 조회."""
+    hosts = parse_hosts(spec)
+    if len(hosts) > SWEEP_MAX_HOSTS:
+        raise ValueError("대상 호스트가 %d개로 너무 많습니다 (최대 %d, 약 /19). "
+                         "범위를 좁혀주세요." % (len(hosts), SWEEP_MAX_HOSTS))
+    jid = uuid.uuid4().hex[:12]
+    job = {
+        "id": jid, "network": spec, "created": time.time(),
+        "total": len(hosts), "processed": 0, "done": False,
+        "phase": "probe", "start_ts": time.time(),
+        "hosts": hosts,
+        "state": {ip: {"status": "scanning", "methods": [], "open_ports": [],
+                       "mac": None, "hostname": None} for ip in hosts},
+    }
+    with _SWEEP_LOCK:
+        _prune_sweep_jobs()
+        _SWEEP_JOBS[jid] = job
+    t = threading.Thread(target=_run_sweep_job,
+                         args=(job, timeout, workers, do_ping, identify),
+                         daemon=True)
+    t.start()
+    return jid, hosts
+
+
+def _run_sweep_job(job, timeout, workers, do_ping, identify):
+    hosts = job["hosts"]
+    state = job["state"]
+    try:
+        # 1단계: TCP 프로브 (완료 즉시 점유 표시)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_probe_alive, ip, timeout): ip for ip in hosts}
+            for fut in concurrent.futures.as_completed(futs):
+                ip, alive, methods, openp = fut.result()
+                with _SWEEP_LOCK:
+                    job["processed"] += 1
+                    if alive:
+                        state[ip]["status"] = "used"
+                        state[ip]["methods"] = list(methods)
+                        state[ip]["open_ports"] = openp
+
+        # 2단계: ICMP (미확인 호스트만)
+        if do_ping:
+            job["phase"] = "icmp"
+            pending = [ip for ip in hosts if state[ip]["status"] != "used"]
+            if pending:
+                def _p(ip):
+                    reachable, _, _ = ping_host(ip, timeout=max(timeout, 1), count=1)
+                    return ip, reachable
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(workers, 64)) as ex:
+                    for fut in concurrent.futures.as_completed(
+                            [ex.submit(_p, ip) for ip in pending]):
+                        ip, reachable = fut.result()
+                        if reachable:
+                            with _SWEEP_LOCK:
+                                state[ip]["status"] = "used"
+                                if "ICMP" not in state[ip]["methods"]:
+                                    state[ip]["methods"].append("ICMP")
+
+        # 3단계: ARP 테이블 (방화벽 뒤 호스트 + MAC)
+        job["phase"] = "arp"
+        host_set = set(hosts)
+        for ip, mac in read_arp_table().items():
+            if ip in host_set:
+                with _SWEEP_LOCK:
+                    state[ip]["status"] = "used"
+                    state[ip]["mac"] = mac
+                    if "ARP" not in state[ip]["methods"]:
+                        state[ip]["methods"].append("ARP")
+
+        # 4단계: 점유 호스트 식별 (역방향 DNS + NetBIOS) — 완료되는 대로 반영
+        if identify:
+            job["phase"] = "identify"
+            used_ips = [ip for ip in hosts if state[ip]["status"] == "used"]
+
+            def _ident(ip):
+                hostname = None
+                try:
+                    hostname = socket.gethostbyaddr(ip)[0]
+                except Exception:
+                    hostname = None
+                mac = None
+                if not hostname:
+                    nb = netbios_query(ip, timeout=1.0)
+                    if nb:
+                        hostname = nb.get("name")
+                        mac = nb.get("mac")
+                return ip, hostname, mac
+
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(len(used_ips) or 1, 40)) as ex:
+                for fut in concurrent.futures.as_completed(
+                        [ex.submit(_ident, ip) for ip in used_ips]):
+                    ip, hostname, mac = fut.result()
+                    with _SWEEP_LOCK:
+                        if hostname:
+                            state[ip]["hostname"] = hostname
+                        if mac and not state[ip]["mac"]:
+                            state[ip]["mac"] = mac
+
+        # 미확인 호스트 → 미사용 확정
+        with _SWEEP_LOCK:
+            for ip in hosts:
+                if state[ip]["status"] == "scanning":
+                    state[ip]["status"] = "free"
+            job["phase"] = "done"
+            job["done"] = True
+            job["elapsed"] = round(time.time() - job["start_ts"], 2)
+    except Exception as e:  # noqa
+        with _SWEEP_LOCK:
+            job["error"] = str(e)
+            job["done"] = True
+
+
+def sweep_snapshot(job_id, offset=0):
+    """작업 진행 상황 스냅샷을 반환한다. offset 이후 변경된 호스트만 포함하지 않고
+    전체 상태를 반환(호스트 수가 많지 않아 단순화)."""
+    with _SWEEP_LOCK:
+        job = _SWEEP_JOBS.get(job_id)
+        if not job:
+            return None
+        hosts_out = []
+        used = 0
+        free = 0
+        for ip in job["hosts"]:
+            st = job["state"][ip]
+            if st["status"] == "used":
+                used += 1
+            elif st["status"] == "free":
+                free += 1
+            hosts_out.append({
+                "ip": ip, "status": st["status"],
+                "mac": st["mac"], "hostname": st["hostname"],
+                "open_ports": st["open_ports"], "methods": st["methods"],
+            })
+        snap = {
+            "ok": True, "id": job_id, "network": job["network"],
+            "total": job["total"], "processed": job["processed"],
+            "phase": job["phase"], "done": job["done"],
+            "usedCount": used, "freeCount": free,
+            "hosts": hosts_out,
+            "elapsed": job.get("elapsed"),
+            "error": job.get("error"),
+        }
+        return snap
+
+
+# ---------------------------------------------------------------------------
 # 출력
 # ---------------------------------------------------------------------------
 def print_progress(done, total):
@@ -1149,6 +1314,43 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             print("  [브리지] 스윕 완료: %s 점유 %d / 미사용 %d (%.1fs)" % (
                 cidr, res["usedCount"], res["freeCount"], res["elapsed"]))
             self._json(res)
+            return
+
+        if path == "/sweep_start":
+            cidr = q("cidr") or q("network") or q("range")
+            if not cidr:
+                self._json({"ok": False, "error": "cidr 파라미터가 필요합니다."},
+                           status=400)
+                return
+            try:
+                timeout = float(q("timeout", "0.4"))
+                workers = int(q("workers", "100"))
+            except ValueError:
+                timeout, workers = 0.4, 100
+            do_ping = q("ping", "1") not in ("0", "false", "no")
+            print("  [브리지] 대역 스윕 시작: %s" % cidr)
+            try:
+                jid, hosts = sweep_start(cidr, timeout=timeout, workers=workers,
+                                         do_ping=do_ping)
+            except ValueError as e:
+                self._json({"ok": False, "error": str(e)}, status=400)
+                return
+            self._json({"ok": True, "jobId": jid, "network": cidr,
+                        "total": len(hosts), "hosts": hosts})
+            return
+
+        if path == "/sweep_status":
+            jid = q("id")
+            if not jid:
+                self._json({"ok": False, "error": "id 파라미터가 필요합니다."},
+                           status=400)
+                return
+            snap = sweep_snapshot(jid)
+            if snap is None:
+                self._json({"ok": False, "error": "작업을 찾을 수 없습니다(만료됨)."},
+                           status=404)
+                return
+            self._json(snap)
             return
 
         self._json({"ok": False, "error": "알 수 없는 경로: %s" % path}, status=404)

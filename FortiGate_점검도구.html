@@ -864,6 +864,16 @@ th.th-dst-intf { background: #dcfce7; color: #14532d; }
         <button class="btn btn-primary" onclick="paSweepScan()" id="paSweepBtn" style="background:#00695c">🌐 대역 스캔</button>
       </div>
       <div id="paSweepSummary" style="display:none;margin-top:10px;font-size:13px;font-weight:bold"></div>
+      <div id="paSweepBar" style="display:none;height:8px;background:#e0e0e0;border-radius:4px;margin-top:6px;overflow:hidden">
+        <div id="paSweepBarFill" style="height:100%;width:0%;background:#00897b;transition:width .2s"></div>
+      </div>
+      <div style="display:none;margin-top:8px;font-size:11px;color:#666" id="paSweepLegend">
+        <span style="display:inline-block;width:10px;height:10px;background:#bdbdbd;border-radius:2px;vertical-align:middle"></span> 확인 중
+        &nbsp;<span style="display:inline-block;width:10px;height:10px;background:#e53935;border-radius:2px;vertical-align:middle"></span> 점유(사용중)
+        &nbsp;<span style="display:inline-block;width:10px;height:10px;background:#43a047;border-radius:2px;vertical-align:middle"></span> 미사용(배정 가능)
+        &nbsp;— IP 칩에 마우스를 올리면 MAC/호스트명이 보입니다.
+      </div>
+      <div id="paSweepGrid" style="display:none;margin-top:8px;flex-wrap:wrap;gap:3px;max-height:260px;overflow-y:auto;padding:6px;background:#fff;border:1px solid #e0e0e0;border-radius:6px"></div>
       <div id="paSweepResult" style="display:none;margin-top:8px;overflow-x:auto"></div>
       <div id="paSweepFree" style="display:none;margin-top:8px;font-size:12px;background:#fff;border:1px solid #c8e6c9;border-radius:6px;padding:8px"></div>
     </div>
@@ -5198,55 +5208,125 @@ function paBridgeScan() {
     });
 }
 
-// ===== 대역 스윕 (IP 충돌 예방) =====
+// ===== 대역 스윕 (IP 충돌 예방) - 진행형(작업 시작 + 폴링) =====
+var _paSweepPoll = null;
+function _paEsc(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+
 function paSweepScan() {
   var cidr = (document.getElementById('paSweepCidr').value || '').trim();
   if (!cidr) { alert('스캔할 대역을 입력하세요. (예: 192.168.10.0/24)'); return; }
   var ping = document.getElementById('paSweepPing').checked ? '1' : '0';
 
+  if (_paSweepPoll) { clearInterval(_paSweepPoll); _paSweepPoll = null; }
   var btn = document.getElementById('paSweepBtn');
   btn.disabled = true; btn.textContent = '⏳ 대역 스캔 중…';
-  paSetBridgeStatus('busy', '대역 스캔 중…');
-  document.getElementById('paSweepSummary').style.display = 'none';
+  paSetBridgeStatus('busy', '대역 스캔 시작…');
   document.getElementById('paSweepResult').style.display = 'none';
   document.getElementById('paSweepFree').style.display = 'none';
 
-  var url = paBridgeBase() + '/sweep?cidr=' + encodeURIComponent(cidr) + '&ping=' + ping;
+  var url = paBridgeBase() + '/sweep_start?cidr=' + encodeURIComponent(cidr) + '&ping=' + ping;
   fetch(url, {cache:'no-store'})
     .then(function(r){ return r.json().then(function(j){ return {status:r.status, body:j}; }); })
     .then(function(res){
       var j = res.body;
       if (!j || !j.ok) {
         paSetBridgeStatus('off', '오류');
-        alert('대역 스캔 실패: ' + ((j && j.error) || ('HTTP ' + res.status)));
+        alert('대역 스캔 시작 실패: ' + ((j && j.error) || ('HTTP ' + res.status)));
+        btn.disabled = false; btn.textContent = '🌐 대역 스캔';
         return;
       }
-      paSetBridgeStatus('ok', '완료 (점유 ' + j.usedCount + ')');
-      paRenderSweep(j);
+      // 즉시 전체 IP 격자를 '확인 중' 상태로 렌더
+      paBuildSweepGrid(j.hosts, j.network);
+      paSweepPollLoop(j.jobId, btn);
     })
     .catch(function(e){
       paSetBridgeStatus('off', '연결 안됨');
       alert('브리지 서버에 연결할 수 없습니다. PortScanner 를 서버 모드로 실행했는지 확인하세요.\n\n' + e);
-    })
-    .finally(function(){
       btn.disabled = false; btn.textContent = '🌐 대역 스캔';
     });
 }
 
-function paRenderSweep(j) {
-  function esc(s){ return String(s==null?'':s).replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
-  _paSweep = j;
+function paBuildSweepGrid(hosts, network) {
+  var grid = document.getElementById('paSweepGrid');
+  var html = '';
+  hosts.forEach(function(ip){
+    var last = ip.split('.').pop();  // 표시는 마지막 옥텟, title 은 전체 IP
+    html += '<span id="sw_' + ip.replace(/\./g,'_') + '" title="' + _paEsc(ip) + '" ' +
+      'style="font-family:monospace;font-size:11px;padding:2px 5px;border-radius:3px;' +
+      'background:#bdbdbd;color:#fff;min-width:26px;text-align:center;cursor:default">' +
+      _paEsc(last) + '</span>';
+  });
+  grid.innerHTML = html;
+  grid.style.display = 'flex';
+  document.getElementById('paSweepBar').style.display = 'block';
+  document.getElementById('paSweepBarFill').style.width = '0%';
+  document.getElementById('paSweepLegend').style.display = 'block';
+  document.getElementById('paSweepSummary').style.display = 'block';
+  document.getElementById('paSweepSummary').innerHTML =
+    '대역 <span style="color:#00695c">' + _paEsc(network) + '</span> — 스캔 준비 중…';
+}
 
-  var sum = document.getElementById('paSweepSummary');
-  sum.innerHTML = '대역 <span style="color:#00695c">' + esc(j.network) + '</span> — ' +
-    '전체 <b>' + j.total + '</b> · ' +
-    '<span style="color:#c62828">점유 ' + j.usedCount + '</span> · ' +
-    '<span style="color:#2e7d32">미사용 ' + j.freeCount + '</span> ' +
-    '<span style="font-weight:400;color:#888;font-size:11px">(' + j.elapsed + '초)</span>';
-  sum.style.display = 'block';
+function paUpdateSweepGrid(snap) {
+  var COLORS = {scanning:'#bdbdbd', used:'#e53935', free:'#43a047'};
+  snap.hosts.forEach(function(h){
+    var el = document.getElementById('sw_' + h.ip.replace(/\./g,'_'));
+    if (!el) return;
+    el.style.background = COLORS[h.status] || '#bdbdbd';
+    var tip = h.ip;
+    if (h.status === 'used') {
+      tip += ' [점유]';
+      if (h.mac) tip += '\nMAC: ' + h.mac;
+      if (h.hostname) tip += '\n호스트: ' + h.hostname;
+      if (h.open_ports && h.open_ports.length) tip += '\n열린포트: ' + h.open_ports.join(',');
+      if (h.methods && h.methods.length) tip += '\n탐지: ' + h.methods.join(',');
+    } else if (h.status === 'free') {
+      tip += ' [미사용 — 배정 가능]';
+    } else {
+      tip += ' [확인 중]';
+    }
+    el.title = tip;
+  });
+  var pct = snap.total ? Math.round(100 * snap.processed / snap.total) : 0;
+  document.getElementById('paSweepBarFill').style.width = pct + '%';
+  var phaseTxt = {probe:'포트 프로브', icmp:'ICMP 확인', arp:'ARP 조회', identify:'호스트 식별', done:'완료'}[snap.phase] || snap.phase;
+  document.getElementById('paSweepSummary').innerHTML =
+    '대역 <span style="color:#00695c">' + _paEsc(snap.network) + '</span> — ' +
+    '전체 <b>' + snap.total + '</b> · ' +
+    '<span style="color:#c62828">점유 ' + snap.usedCount + '</span> · ' +
+    '<span style="color:#2e7d32">미사용 ' + snap.freeCount + '</span> ' +
+    (snap.done
+      ? '<span style="font-weight:400;color:#888;font-size:11px">(완료' + (snap.elapsed!=null?(' · '+snap.elapsed+'초'):'') + ')</span>'
+      : '<span style="font-weight:400;color:#888;font-size:11px">(' + phaseTxt + ' ' + snap.processed + '/' + snap.total + ')</span>');
+}
+
+function paSweepPollLoop(jobId, btn) {
+  var statusUrl = paBridgeBase() + '/sweep_status?id=' + encodeURIComponent(jobId);
+  var poll = function() {
+    fetch(statusUrl, {cache:'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(snap){
+        if (!snap || !snap.ok) { return; }
+        paUpdateSweepGrid(snap);
+        if (snap.done) {
+          if (_paSweepPoll) { clearInterval(_paSweepPoll); _paSweepPoll = null; }
+          paSetBridgeStatus('ok', '완료 (점유 ' + snap.usedCount + ')');
+          paRenderSweepFinal(snap);
+          btn.disabled = false; btn.textContent = '🌐 대역 스캔';
+        }
+      })
+      .catch(function(){ /* 일시 오류는 다음 폴링에서 회복 */ });
+  };
+  poll();
+  _paSweepPoll = setInterval(poll, 700);
+}
+
+function paRenderSweepFinal(snap) {
+  _paSweep = snap;
+  var used = snap.hosts.filter(function(h){ return h.status === 'used'; });
+  var free = snap.hosts.filter(function(h){ return h.status === 'free'; }).map(function(h){ return h.ip; });
 
   var res = document.getElementById('paSweepResult');
-  if (j.used && j.used.length) {
+  if (used.length) {
     var html = '<table style="width:100%;border-collapse:collapse;font-size:12px">' +
       '<thead><tr style="background:#00695c;color:#fff">' +
       '<th style="padding:5px 8px;text-align:left">IP (점유중 — 배정 금지)</th>' +
@@ -5254,13 +5334,13 @@ function paRenderSweep(j) {
       '<th style="padding:5px 8px;text-align:left">호스트명</th>' +
       '<th style="padding:5px 8px;text-align:left">열린 포트</th>' +
       '<th style="padding:5px 8px;text-align:left">탐지</th></tr></thead><tbody>';
-    j.used.forEach(function(u){
+    used.forEach(function(u){
       html += '<tr style="border-bottom:1px solid #eee">' +
-        '<td style="padding:5px 8px;font-family:monospace;font-weight:bold">' + esc(u.ip) + '</td>' +
-        '<td style="padding:5px 8px;font-family:monospace">' + esc(u.mac || '-') + '</td>' +
-        '<td style="padding:5px 8px">' + esc(u.hostname || '-') + '</td>' +
-        '<td style="padding:5px 8px">' + esc((u.open_ports || []).join(', ') || '-') + '</td>' +
-        '<td style="padding:5px 8px;color:#666">' + esc((u.methods || []).join(',') || '-') + '</td></tr>';
+        '<td style="padding:5px 8px;font-family:monospace;font-weight:bold">' + _paEsc(u.ip) + '</td>' +
+        '<td style="padding:5px 8px;font-family:monospace">' + _paEsc(u.mac || '-') + '</td>' +
+        '<td style="padding:5px 8px">' + _paEsc(u.hostname || '-') + '</td>' +
+        '<td style="padding:5px 8px">' + _paEsc((u.open_ports || []).join(', ') || '-') + '</td>' +
+        '<td style="padding:5px 8px;color:#666">' + _paEsc((u.methods || []).join(',') || '-') + '</td></tr>';
     });
     html += '</tbody></table>';
     res.innerHTML = html;
@@ -5270,12 +5350,11 @@ function paRenderSweep(j) {
   res.style.display = 'block';
 
   var freeBox = document.getElementById('paSweepFree');
-  var free = j.free || [];
   var shown = free.slice(0, 256);
   freeBox.innerHTML = '<div style="font-weight:bold;color:#2e7d32;margin-bottom:4px">🟢 배정 가능한(미사용) IP ' +
     '<span style="font-weight:400;color:#888">— ' + free.length + '개</span></div>' +
     '<div style="font-family:monospace;color:#333;line-height:1.6;word-break:break-all">' +
-    (shown.map(esc).join(', ') || '(없음)') +
+    (shown.map(_paEsc).join(', ') || '(없음)') +
     (free.length > shown.length ? (' … 외 ' + (free.length - shown.length) + '개') : '') + '</div>';
   freeBox.style.display = 'block';
 }
