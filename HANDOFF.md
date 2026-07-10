@@ -77,6 +77,11 @@ README.md / .gitignore / HANDOFF.md(이 파일)
   ②FQDN(도메인) 주소 22개 침묵 누락 → `set type fqdn`으로 변환 추가, ③zone screen(DoS) 옵션 52줄 → 미변환 안내로 분리.
   잔여 침묵 무시 73줄은 clock/ntp/vrouter/log/flow 등 정책 마이그레이션과 무관한 시스템 설정.
 - 미구현(수동): IPsec VPN(IKE/phase), DIP, 관리자/SNMP/인증 → unmapped 섹션 + 경고로 안내.
+- **전체 Config 대조 뷰**(`out.full`, 기본 탭): 좌=원본 config 전체(줄 순서 유지), 우=각 줄의 변환 결과.
+  변환됨=녹색 FG 블록, 상위 블록에 흡수된 연속줄=회색 "↑포함", 미변환=주황 "! 미변환(카테고리)",
+  변환 대상 아님(clock/ntp 등)=공란. 마이그레이션 누락을 한 화면에서 검증. `showConvertSection`에 `type==='full'` 분기,
+  객체별 좌우 라인수 패딩으로 정렬(연동 스크롤 호환). fgMaps=parseFGBlocksForType로 재사용.
+- **CSV export 버그 수정**: `downloadConvertCSV`가 unmapped item의 없는 `it.lines`를 참조해 예외로 버튼 무반응 → `it.lines?` 가드.
 
 ## 다음 작업
 **수정할 탭과 원하는 변경 내용을 사용자에게 확인한 뒤 진행.**

@@ -2638,6 +2638,7 @@ var CONVERT_TYPE_META = {
   unmapped:  { label: '미변환 항목',   color: '#e65100', icon: '⚠️' },
   junos:     { label: 'JunOS (원본)',  color: '#1565c0', icon: '🟦' },
   screenos:  { label: 'ScreenOS (원본)', color: '#e65100', icon: '🟧' },
+  full:      { label: '전체 Config 대조', color: '#c1121f', icon: '📋' },
   unknown:   { label: '알 수 없음',    color: '#999',    icon: '❓' }
 };
 
@@ -4391,6 +4392,57 @@ function convertScreenOS(text) {
   if (uaK.length) convertWarnings.push('정책이 참조하지만 정의되지 않은 <b>주소</b> '+uaK.length+'개: '+uaK.slice(0,8).join(', ')+(uaK.length>8?' …':''));
   if (usK.length) convertWarnings.push('정책이 참조하지만 정의되지 않은 <b>서비스</b> '+usK.length+'개: '+usK.slice(0,8).join(', ')+(usK.length>8?' …':''));
 
+  // ── 전체 Config 대조(coverage) 뷰 ──
+  // 좌측: 원본 config 전체(줄 순서 유지) / 우측: 각 줄의 변환 결과.
+  // 변환 불가·대상 아님 → 우측 공란(미변환 표시). 마이그레이션 누락을 한눈에 검증.
+  var fgMaps = {};
+  ['address','addrgrp','service','svcgrp','policy','routing','nat','interface','zone'].forEach(function(ty){
+    fgMaps[ty] = parseFGBlocksForType(ty, (out[ty] || {}).config || '');
+  });
+  fgMaps.system = { system: out.system.config };
+
+  var segs = [], emitted = {}, convObj = 0, nonBlank = 0, polCur = null;
+  lines.forEach(function(raw){
+    var line = raw.replace(/\s+$/, '');
+    var s = line.trim();
+    if (!s) { segs.push({ o:[''], f:[''], k:'blank' }); return; }
+    nonBlank++;
+    var p = _soTok(s), w0 = p[0], w1 = p[1] || '';
+    var type = null, key = null, um = null;
+
+    if (w0==='set' && w1==='interface' && p.indexOf('mip')>=0) { type='nat'; key='[VIP] MIP_'+p[p.indexOf('mip')+1]; }
+    else if (w0==='set' && w1==='address' && p[3]) { type='address'; key=p[3]; }
+    else if (w0==='set' && w1==='group' && p[2]==='address' && (p[3]||p[4])) { type='addrgrp'; key=(p[4]&&p[4]!=='add'&&p[4]!=='comment')?p[4]:p[3]; }
+    else if (w0==='set' && w1==='group' && p[2]==='service' && p[3]) { type='svcgrp'; key=p[3]; }
+    else if (w0==='set' && w1==='service' && p[2]) { type='service'; key=p[2]; }
+    else if (w0==='set' && w1==='route' && p[2]) { var d=p[2].split('/'); type='routing'; key=d[0]+'/'+netmaskToCidr(cidrToNetmask(d[1]||'32')); }
+    else if (w0==='set' && w1==='interface' && /^ethernet/.test(p[2]||'')) { type='interface'; key=_screenosIfMap[p[2]]||p[2]; }
+    else if (w0==='set' && w1==='zone' && p[3]==='screen') { um='Zone Screen (DoS 방어)'; }
+    else if (w0==='set' && w1==='zone' && p[2]) { type='zone'; key=(p[2]==='id')?p[4]:p[2]; }
+    else if (w0==='set' && w1==='policy' && p[2]==='id' && p[3]) { type='policy'; key=_screenosPolNameMap[p[3]]||('Policy_'+p[3]); polCur=key; }
+    else if (polCur && w0==='set' && (w1==='src-address'||w1==='dst-address'||w1==='service')) { type='policy'; key=polCur; }
+    else if (w0==='set' && w1==='hostname') { type='system'; key='system'; }
+    else if (w0==='set' && w1==='dns' && p[2]==='host') { type='system'; key='system'; }
+    else if (w1==='ike'||w1==='vpn'||w1==='ipsec') um='VPN / IPsec (터널)';
+    else if (w1==='admin') um='관리자 계정';
+    else if (w1==='snmp'||w1==='snmpv3'||w1==='nsmgmt') um='SNMP / 관리';
+    else if (w1==='auth'||w1==='auth-server'||w1==='user'||w1==='user-group') um='인증 / 사용자';
+    else if (w1==='url'||w1==='alg'||w1==='traffic-shaping') um='URL필터 / ALG / QoS';
+
+    if (s==='exit') polCur = null;
+
+    if (type && key) {
+      var idk = type+'|'+key, fg = (fgMaps[type]||{})[key];
+      if (fg && !emitted[idk]) { emitted[idk]=true; convObj++; segs.push({ o:[line], f:fg.split('\n'), k:'conv' }); }
+      else segs.push({ o:[line], f:['! ↑ 상위 변환 항목에 포함됨'], k:'fold' });
+    } else if (um) {
+      segs.push({ o:[line], f:['! 미변환 ('+um+') — 수동 설정 필요'], k:'unmapped' });
+    } else {
+      segs.push({ o:[line], f:[''], k:'skip' });   // 변환 대상 아님(시스템 설정 등) → 공란
+    }
+  });
+  out.full = { segments: segs, count: nonBlank, converted: convObj, isFull: true };
+
   return out;
 }
 
@@ -4571,6 +4623,7 @@ function runConversion() {
   if (convertFiles['screenos'] && convertFiles['screenos'].content) {
     var soRes = convertScreenOS(convertFiles['screenos'].content);
     var soLabelMap = {
+      full:      '📋 전체 Config 대조',
       system:    '시스템 설정',
       interface: '인터페이스',
       zone:      'Zone',
@@ -4583,7 +4636,8 @@ function runConversion() {
       nat:       'NAT (MIP→VIP)',
       unmapped:  '⚠️ 미변환 항목'
     };
-    ['system','interface','zone','address','addrgrp','service','svcgrp','policy','routing','nat','unmapped'].forEach(function(t) {
+    // 'full'(전체 대조)을 맨 앞에 두어 기본 뷰로 노출 → 원본 누락 검증 우선.
+    ['full','system','interface','zone','address','addrgrp','service','svcgrp','policy','routing','nat','unmapped'].forEach(function(t) {
       var r = soRes[t];
       if (r && (r.count > 0 || t === 'unmapped')) {
         convertResults[t] = r;
@@ -4630,6 +4684,40 @@ function showConvertSection(type) {
 
   var origEl = document.getElementById('convertOriginal');
   var fgEl   = document.getElementById('convertOutput');
+
+  // ── 전체 Config 대조 뷰: 좌=원본 전체, 우=변환/미변환(공란) ──
+  if (type === 'full' && r.isFull) {
+    var _e = function(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
+    var oOut = [], fOut = [];
+    r.segments.forEach(function(seg){
+      var o = seg.o.slice(), f = seg.f.slice();
+      var n = Math.max(o.length, f.length);
+      while (o.length < n) o.push('');
+      while (f.length < n) f.push('');
+      for (var i = 0; i < n; i++) {
+        oOut.push(o[i]);
+        var fl = f[i];
+        if (seg.k === 'conv')          fOut.push('<span style="color:#4caf50">'+_e(fl)+'</span>');
+        else if (seg.k === 'unmapped') fOut.push('<span style="color:#ff9800">'+_e(fl)+'</span>');
+        else if (seg.k === 'fold')     fOut.push('<span style="color:#666">'+_e(fl)+'</span>');
+        else                           fOut.push(_e(fl));   // skip/blank → 공란
+      }
+    });
+    origEl.textContent = oOut.join('\n');
+    fgEl.innerHTML     = fOut.join('\n');
+    origEl.scrollTop = 0; fgEl.scrollTop = 0;
+    var _sl = document.getElementById('convertSyncScroll'); if (_sl) _sl.value = 0;
+    document.getElementById('convertUnmappedBox').style.display = 'none';
+    var _tabs = document.querySelectorAll('[id^="ctab_"]');
+    for (var _k = 0; _k < _tabs.length; _k++) {
+      var _act = _tabs[_k].id === 'ctab_full';
+      var _warn = _tabs[_k].id === 'ctab_unmapped';
+      _tabs[_k].style.background  = _act ? '#c1121f' : (_warn ? '#fff3e0' : '#e3f2fd');
+      _tabs[_k].style.color       = _act ? 'white'   : (_warn ? '#e65100' : '#1565c0');
+      _tabs[_k].style.borderColor = _act ? '#c1121f' : (_warn ? '#ffcc80' : '#bbdefb');
+    }
+    return;
+  }
 
   // ── NAT 섹션 전용 렌더링 (원본 rule-set 전부 표시 + VIP 주황색) ──
   function _colorNatFg(config) {
@@ -5085,7 +5173,8 @@ function downloadConvertCSV() {
   if (um && um.items) {
     rows.push(['▶ ⚠️ 미변환 항목 (수동 설정 필요)', '', '', '', '']);
     um.items.forEach(function(it) {
-      rows.push(['미변환', it.label, it.lines.join('\n'), '수동 설정 필요', it.reason]);
+      var origTxt = it.lines ? it.lines.join('\n') : '';   // items는 {label,reason}만 가질 수 있음
+      rows.push(['미변환', it.label, origTxt, '수동 설정 필요', it.reason]);
     });
   }
 
