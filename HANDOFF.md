@@ -62,7 +62,12 @@ README.md / .gitignore / HANDOFF.md(이 파일)
 - 변환 매핑: `set address`→firewall address, `set group address`→addrgrp, `set service`(+ 연속)→service custom
   (tcp/udp-portrange, src 1-65535 생략), `set group service`→service group, `set policy id`(서브블록 src/dst/service 병합,
   `nat src`→`set nat enable`, `disable`→`set status disable`, `permit/deny`, `tunnel`→accept+IPsec 주석)→firewall policy,
-  `set route`→router static, `set interface … mip`→firewall vip(static NAT), zone→system zone(ethernet0/N→portN 매핑).
+  `set route`→router static, zone→system zone(ethernet0/N→portN 매핑).
+- **MIP(양방향 1:1 NAT)**: `set interface … mip`→`firewall vip` + `set nat-source-vip enable`.
+  ScreenOS MIP은 인바운드 DNAT + 아웃바운드 SNAT(공인 IP)를 자동 수행 → FortiGate에선
+  VIP에 `nat-source-vip enable`(기본 꺼짐)을 켜야 매핑 호스트 아웃바운드가 VIP 외부 IP로 SNAT됨.
+  IP Pool은 오히려 우선순위(Pool>VIP-extip)로 오버라이드하므로 사용하지 않음. 참고:
+  Fortinet KB "Mapping VIP outbound connections (Source NAT)".
 - **인코딩**: ScreenOS config는 EUC-KR/CP949 → `handleConvertFiles`가 ArrayBuffer로 읽어 UTF-8 실패 시 `TextDecoder('euc-kr')` 재디코딩.
 - 좌우 diff/CSV 정렬: `detectConvertFileType`·`CONVERT_TYPE_META`·`runConversion`·`parseOrigBlocks`(screenos 분기)·`downloadConvert`에 screenos 배선.
 - e2e 검증: 실제 SSG550 config(9,868줄)로 Chromium 업로드→변환, pageerror 0. 주소3982·정책186·서비스107·MIP(VIP)39 등 정상, 한글 오브젝트명·VPN명 복원 확인.

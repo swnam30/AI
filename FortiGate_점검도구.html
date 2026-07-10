@@ -4310,6 +4310,10 @@ function convertScreenOS(text) {
     vL.push('    set extip '+mp.pub);
     vL.push('    set extintf "'+mp.extif+'"');
     vL.push('    set mappedip "'+mp.host+'"');
+    // ScreenOS MIP은 양방향(1:1) NAT. nat-source-vip를 켜면 매핑 호스트의 아웃바운드
+    // 트래픽도 VIP 외부(공인) IP로 SNAT되어 MIP 동작을 완전히 재현한다.
+    // (미설정 시 기본값=출력 인터페이스 IP로 SNAT되어 공인 IP가 유지되지 않음)
+    vL.push('    set nat-source-vip enable');
     vL.push('  next'); vCount++;
   });
   vL.push('end');
@@ -4359,7 +4363,8 @@ function convertScreenOS(text) {
   out.unmapped = { items:umItems, count:umItems.length, original:umOrig.join('\n'), config:'' };
 
   // ── 변환 경고 ──
-  convertWarnings.push('ScreenOS 변환은 <b>초안</b>입니다. VPN(IPsec)·MIP/DIP·인증 설정은 반드시 수동 검토하세요.');
+  convertWarnings.push('ScreenOS 변환은 <b>초안</b>입니다. VPN(IPsec)·DIP·인증 설정은 반드시 수동 검토하세요.');
+  if (vCount) convertWarnings.push('MIP '+vCount+'건 → 양방향 재현을 위해 VIP에 <b>set nat-source-vip enable</b> 적용. 인바운드는 정책 dstaddr의 VIP 참조로, 아웃바운드는 매핑 호스트가 나가는 정책에 <b>set nat enable</b>이 있으면 공인 IP로 SNAT됩니다(없으면 사설 IP 유지 → 확인 필요).');
   convertWarnings.push('인터페이스 매핑 → ' + (physIfs.length ? physIfs.map(function(f){ return f+'→'+mapIf(f); }).join(', ') : '없음') + ' (필요 시 정책의 srcintf/dstintf 확인)');
   var uaK = Object.keys(undefAddr), usK = Object.keys(undefSvc);
   if (uaK.length) convertWarnings.push('정책이 참조하지만 정의되지 않은 <b>주소</b> '+uaK.length+'개: '+uaK.slice(0,8).join(', ')+(uaK.length>8?' …':''));
