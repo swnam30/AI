@@ -673,8 +673,8 @@ th.th-dst-intf { background: #dcfce7; color: #14532d; }
       <label style="cursor:pointer;display:flex;align-items:center;gap:8px;padding:8px 16px;border:2px solid #1565c0;border-radius:6px;background:#e3f2fd;font-weight:600">
         <input type="radio" name="convertSrc" value="junos"> Juniper SRX / JunOS (set format)
       </label>
-      <label style="cursor:pointer;display:flex;align-items:center;gap:8px;padding:8px 16px;border:2px solid #ddd;border-radius:6px;color:#aaa">
-        <input type="radio" name="convertSrc" value="screenos" disabled> NetScreen ScreenOS <span style="font-size:11px">(준비중)</span>
+      <label style="cursor:pointer;display:flex;align-items:center;gap:8px;padding:8px 16px;border:2px solid #e65100;border-radius:6px;background:#fff3e0;font-weight:600">
+        <input type="radio" name="convertSrc" value="screenos"> NetScreen ScreenOS (SSG/ISG set format)
       </label>
     </div>
   </div>
@@ -692,6 +692,8 @@ th.th-dst-intf { background: #dcfce7; color: #14532d; }
       <span style="background:#e8eaf6;color:#283593;padding:2px 7px;border-radius:4px">NAT XLSX</span>
       &nbsp;&nbsp;<strong style="color:#1565c0">JunOS:</strong>
       <span style="background:#e3f2fd;color:#0d47a1;padding:2px 7px;border-radius:4px">단일 .dat/.conf/.txt (전체 변환)</span>
+      &nbsp;&nbsp;<strong style="color:#e65100">ScreenOS:</strong>
+      <span style="background:#fff3e0;color:#e65100;padding:2px 7px;border-radius:4px">단일 .cfg/.txt (전체 변환, EUC-KR 자동 인식)</span>
     </p>
     <div class="drop-zone" id="dropZone5" onclick="document.getElementById('fileInput5').click()">
       <div class="icon">📂</div>
@@ -2635,6 +2637,7 @@ var CONVERT_TYPE_META = {
   system:    { label: '시스템 설정',   color: '#4527a0', icon: '⚙️' },
   unmapped:  { label: '미변환 항목',   color: '#e65100', icon: '⚠️' },
   junos:     { label: 'JunOS (원본)',  color: '#1565c0', icon: '🟦' },
+  screenos:  { label: 'ScreenOS (원본)', color: '#e65100', icon: '🟧' },
   unknown:   { label: '알 수 없음',    color: '#999',    icon: '❓' }
 };
 
@@ -2646,6 +2649,13 @@ function detectConvertFileType(text) {
       (/^set system host-name/m.test(first200) && /^set security/m.test(first200)) ||
       (/^set routing-options static/m.test(first200) && /^set security (address-book|policies)/m.test(first200))) {
     return 'junos';
+  }
+  // NetScreen ScreenOS "set format" 감지 (SSG/ISG). 정책·주소·그룹 문법이 고유.
+  if (/^set policy id \d+ /m.test(clean) ||
+      /^set address "[^"]+" "[^"]+" \d+\.\d+\.\d+\.\d+/m.test(clean) ||
+      /^set group (address|service) "/m.test(clean) ||
+      (/^unset key protection/m.test(clean) && /^set interface "ethernet/m.test(clean))) {
+    return 'screenos';
   }
   var firstLine = clean.split('\n')[0];
   var fl = firstLine.toLowerCase();
@@ -2700,13 +2710,19 @@ function handleConvertFiles(files) {
       } else {
         var r = new FileReader();
         r.onload = function(ev) {
-          var content = ev.target.result;
+          var buf = ev.target.result;
+          var content = new TextDecoder('utf-8').decode(buf);
           var type = detectConvertFileType(content);
+          // ScreenOS config는 통상 EUC-KR/CP949 (한글 오브젝트명). UTF-8 디코딩이
+          // 깨졌으면(치환문자 U+FFFD) EUC-KR로 재디코딩한다.
+          if (type === 'screenos' && content.indexOf('�') >= 0) {
+            try { content = new TextDecoder('euc-kr').decode(buf); } catch (e) {}
+          }
           if (!convertFiles[type]) convertFiles[type] = { name: file.name, content: content };
           pending--;
           if (pending === 0) renderConvertFileList();
         };
-        r.readAsText(file, 'utf-8');
+        r.readAsArrayBuffer(file);
       }
     })(files[fi]);
   }
@@ -3941,6 +3957,417 @@ function extractIPFromName(name) {
   return m ? m[1] : null;
 }
 
+// ============================================================
+// ⑤ ScreenOS (NetScreen SSG/ISG) → FortiGate 변환
+// ============================================================
+var _screenosPolNameMap = {};  // policyId → FortiGate 정책명 (뷰어 원본 정렬용)
+var _screenosIfMap       = {};  // ScreenOS 물리 인터페이스 → FortiGate 포트명
+
+// ScreenOS 한 줄을 쌍따옴표 인식하며 토큰화 (따옴표 안의 공백/한글 이름은 한 토큰)
+function _soTok(line) {
+  var out = [], re = /"([^"]*)"|(\S+)/g, m;
+  while ((m = re.exec(line)) !== null) out.push(m[1] !== undefined ? m[1] : m[2]);
+  return out;
+}
+// FortiGate 오브젝트명 정리 (쌍따옴표 제거, 79자 제한)
+function _soName(n) {
+  if (n == null) return 'obj';
+  var s = String(n).replace(/"/g, "'").trim();
+  if (s.length > 79) s = s.slice(0, 79);
+  return s || 'obj';
+}
+// "MIP(1.2.3.4)" → "MIP_1.2.3.4" (FortiGate VIP명)
+function _soMipName(ref) {
+  var m = String(ref || '').match(/MIP\(([\d.]+)\)/);
+  return m ? 'MIP_' + m[1] : null;
+}
+
+function convertScreenOS(text) {
+  _screenosPolNameMap = {};
+  _screenosIfMap = {};
+  var lines = text.replace(/\r/g, '').split('\n');
+  var q = function(s){ return '"' + s + '"'; };
+  var _uniq = function(arr){ var seen={}, r=[]; arr.forEach(function(v){ if(v!=null && !seen[v]){ seen[v]=1; r.push(v); } }); return r; };
+  var _polById = function(arr, id){ for (var i=arr.length-1;i>=0;i--) if (arr[i].id===id) return arr[i]; return null; };
+
+  // ── 1차: 물리 인터페이스 → FortiGate 포트 매핑 (ethernet0/0 → port1 …) ──
+  var physIfs = [];
+  lines.forEach(function(l){
+    var m = l.match(/^set interface "?(ethernet[\d/]+)"?\b/);
+    if (m && physIfs.indexOf(m[1]) < 0) physIfs.push(m[1]);
+  });
+  physIfs.sort();
+  physIfs.forEach(function(ifn, i){ _screenosIfMap[ifn] = 'port' + (i + 1); });
+  var mapIf = function(ifn){ return _screenosIfMap[ifn] || ifn; };
+
+  // ── 참조 변환 헬퍼 ──
+  var _addrRef = function(n){
+    if (!n || /^any$/i.test(n)) return 'all';
+    var mip = _soMipName(n); if (mip) return mip;
+    return _soName(n);
+  };
+  var _svcRef = function(n){ if (!n || /^any$/i.test(n)) return 'ALL'; return _soName(n); };
+
+  // ── 수집 구조 ──
+  var ifaces = {};      // ifn → {cidr, zone, manageable}
+  var zoneIf = {};      // zone → [ports]
+  var zonesSeen = {};
+  var addrs = {}, addrOrder = [];        // name → {ip, mask, comment}
+  var grps = {}, grpOrder = [];          // name → {members:[], comment}
+  var svcs = {}, svcOrder = [];          // name → [{proto, sl, sh, dl, dh, other}]
+  var svcGrps = {}, svcGrpOrder = [];    // name → [members]
+  var routes = [];      // {dst, mask, dev, gw, tunnel}
+  var mips = [];        // {pub, host, mask, extif}
+  var policies = [];    // {id, name, fz, tz, srcs, dsts, svcs, action, natSrc, isTunnel, vpnName, log, disable}
+  var sys = { hostname:'', dns:[] };
+  var unmappedRaw = {}; // 카테고리 → [원본 라인]
+  var curPol = null;    // 정책 서브블록 편집 중
+
+  for (var li = 0; li < lines.length; li++) {
+    var line = lines[li].trim();
+    if (!line) continue;
+    var t = _soTok(line);
+
+    // ── 정책 서브블록 편집 모드 ──
+    if (curPol) {
+      if (line === 'exit') { curPol = null; continue; }
+      if (t[0]==='set' && t[1]==='src-address' && t[2]) { curPol.srcs.push(t[2]); continue; }
+      if (t[0]==='set' && t[1]==='dst-address' && t[2]) { curPol.dsts.push(t[2]); continue; }
+      if (t[0]==='set' && t[1]==='service'     && t[2]) { curPol.svcs.push(t[2]); continue; }
+      continue; // set log 등 나머지 서브옵션은 무시
+    }
+
+    if (t[0] !== 'set' && t[0] !== 'unset') continue;
+    var kw = t[1];
+
+    // ── 주소 오브젝트 ──  set address "zone" "name" IP MASK [comment]
+    if (t[0]==='set' && kw==='address' && t.length>=6 && /^\d+\.\d+\.\d+\.\d+$/.test(t[4])) {
+      var an = t[3];
+      if (!/^any$/i.test(an) && !addrs[an]) {
+        addrs[an] = { ip:t[4], mask:t[5], comment:(t[6] && t[6]!==an) ? t[6] : '' };
+        addrOrder.push(an);
+      }
+      continue;
+    }
+    // ── 주소 그룹 ──  set group address "zone" "grp" [add "member"] [comment "x"]
+    if (t[0]==='set' && kw==='group' && t[2]==='address') {
+      var gn = t[3];
+      if (!grps[gn]) { grps[gn] = { members:[], comment:'' }; grpOrder.push(gn); }
+      var ai = t.indexOf('add');     if (ai>=0 && t[ai+1]) grps[gn].members.push(t[ai+1]);
+      var ci = t.indexOf('comment'); if (ci>=0 && t[ci+1]) grps[gn].comment = t[ci+1];
+      continue;
+    }
+    // ── 서비스 그룹 ──  set group service "grp" [add "member"]
+    if (t[0]==='set' && kw==='group' && t[2]==='service') {
+      var sgn = t[3];
+      if (!svcGrps[sgn]) { svcGrps[sgn] = []; svcGrpOrder.push(sgn); }
+      var sai = t.indexOf('add'); if (sai>=0 && t[sai+1]) svcGrps[sgn].push(t[sai+1]);
+      continue;
+    }
+    // ── 서비스 ──  set service "name" protocol tcp src-port a-b dst-port c-d  (또는 "+ tcp …" 연속)
+    if (t[0]==='set' && kw==='service' && t[2]) {
+      var svn = t[2], proto = null;
+      var pi = t.indexOf('protocol');
+      if (pi>=0) proto = t[pi+1];
+      else if (t[3]==='+') proto = t[4];
+      var spi = t.indexOf('src-port'), dpi = t.indexOf('dst-port');
+      if (proto==='tcp' || proto==='udp') {
+        if (dpi>=0) {
+          var sp = (spi>=0 ? t[spi+1] : '1-65535').split('-');
+          var dp = t[dpi+1].split('-');
+          if (!svcs[svn]) { svcs[svn]=[]; svcOrder.push(svn); }
+          svcs[svn].push({ proto:proto, sl:+sp[0], sh:+sp[1], dl:+dp[0], dh:+dp[1] });
+        }
+      } else if (proto) {
+        if (!svcs[svn]) { svcs[svn]=[]; svcOrder.push(svn); }
+        svcs[svn].push({ proto:proto, other:true });
+      }
+      continue;
+    }
+    // ── 인터페이스 ──
+    if (t[0]==='set' && kw==='interface' && t[2]) {
+      var ifn = t[2];
+      if (t[3]==='zone' && t[4]) {
+        if (/^ethernet/.test(ifn)) {
+          var z = t[4], p = mapIf(ifn);
+          (ifaces[ifn] = ifaces[ifn]||{}).zone = z;
+          zonesSeen[z] = true;
+          if (!zoneIf[z]) zoneIf[z] = [];
+          if (zoneIf[z].indexOf(p) < 0) zoneIf[z].push(p);
+        } // tunnel.x zone 바인딩 → VPN, 생략
+      } else if (t[3]==='ip' && /^\d+\.\d+\.\d+\.\d+\/\d+$/.test(t[4]||'')) {
+        (ifaces[ifn] = ifaces[ifn]||{}).cidr = t[4];
+      } else if (t[3]==='ip' && t[4]==='manageable') {
+        (ifaces[ifn] = ifaces[ifn]||{}).manageable = true;
+      } else if (t[3]==='mip' && t[4]) {
+        var hi = t.indexOf('host'), ni = t.indexOf('netmask');
+        mips.push({ pub:t[4], host:(hi>=0?t[hi+1]:''), mask:(ni>=0?t[ni+1]:'255.255.255.255'), extif:mapIf(ifn) });
+      }
+      continue;
+    }
+    // ── Zone 정의 ──
+    if (t[0]==='set' && kw==='zone' && t[2]) {
+      if (t[2]==='id' && t[4]) zonesSeen[t[4]] = true;
+      else zonesSeen[t[2]] = true;
+      continue;
+    }
+    // ── 정적 라우팅 ──  set route DST/M interface IF [gateway GW]
+    if (t[0]==='set' && kw==='route' && t[2]) {
+      var dm = t[2].split('/');
+      var ii = t.indexOf('interface'), gi = t.indexOf('gateway');
+      var dev = ii>=0 ? t[ii+1] : '';
+      routes.push({
+        dst: dm[0], mask: cidrToNetmask(dm[1]||'32'),
+        dev: /^ethernet/.test(dev) ? mapIf(dev) : dev,
+        gw: gi>=0 ? t[gi+1] : '',
+        tunnel: /^tunnel/.test(dev)
+      });
+      continue;
+    }
+    // ── 정책 ──
+    if (t[0]==='set' && kw==='policy' && t[2]==='id' && t[3]) {
+      var pid = t[3];
+      if (t.length === 4) {                      // "set policy id N" → 서브블록 진입
+        curPol = _polById(policies, pid);
+        if (!curPol) curPol = { id:pid, srcs:[], dsts:[], svcs:[] }; // stub(무시됨)
+        continue;
+      }
+      if (t[4]==='disable' && t.length===5) {    // "set policy id N disable"
+        var pp = _polById(policies, pid); if (pp) pp.disable = true;
+        continue;
+      }
+      // 기본 정의 라인
+      var j = 4, pname = '';
+      if (t[j]==='name') { pname = t[j+1]; j += 2; }
+      var fz='', tz='';
+      if (t[j]==='from') { fz = t[j+1]; j += 2; }
+      if (t[j]==='to')   { tz = t[j+1]; j += 2; }
+      var psrc = t[j++], pdst = t[j++], psvc = t[j++];
+      var rest = t.slice(j);
+      var action='accept', natSrc=false, isTunnel=false, vpnName='', logp=false;
+      for (var ri=0; ri<rest.length; ri++) {
+        var w = rest[ri];
+        if (w==='permit') action='accept';
+        else if (w==='deny' || w==='reject') action='deny';
+        else if (w==='tunnel') { action='accept'; isTunnel=true; }
+        else if (w==='nat') natSrc=true;
+        else if (w==='vpn') vpnName = rest[ri+1] || '';
+        else if (w==='log') logp=true;
+      }
+      policies.push({ id:pid, name:pname, fz:fz, tz:tz,
+        srcs:[psrc], dsts:[pdst], svcs:[psvc],
+        action:action, natSrc:natSrc, isTunnel:isTunnel, vpnName:vpnName, log:logp, disable:false });
+      continue;
+    }
+    // ── 시스템 ──
+    if (t[0]==='set' && kw==='hostname' && t[2]) { sys.hostname = t[2]; continue; }
+    if (t[0]==='set' && kw==='dns' && t[2]==='host' && t[4] && t[4]!=='0.0.0.0') { sys.dns.push(t[4]); continue; }
+
+    // ── 미변환 카테고리 수집 ──
+    var umCat = null;
+    if (kw==='ike' || kw==='vpn' || kw==='ipsec') umCat = 'VPN / IPsec (터널)';
+    else if (kw==='admin') umCat = '관리자 계정';
+    else if (kw==='snmp' || kw==='snmpv3' || kw==='nsmgmt') umCat = 'SNMP / 관리';
+    else if (kw==='auth' || kw==='auth-server' || kw==='user' || kw==='user-group') umCat = '인증 / 사용자';
+    else if (kw==='url' || kw==='alg' || kw==='traffic-shaping') umCat = 'URL필터 / ALG / QoS';
+    if (umCat) (unmappedRaw[umCat] = unmappedRaw[umCat] || []).push(line);
+  }
+
+  // ── 섹션별 원본 라인 버킷 (좌측 원본 뷰/CSV 정렬용) ──
+  function buildBuckets() {
+    var b = { address:[], addrgrp:[], svcgrp:[], service:[], interface:[], zone:[], routing:[], nat:[], policy:[], system:[] };
+    var inPol = false;
+    lines.forEach(function(l){
+      var s = l.trim(); if (!s) return;
+      if (inPol) { b.policy.push(s); if (s==='exit') inPol=false; return; }
+      if (/^set address "[^"]+" "[^"]+" \d/.test(s)) b.address.push(s);
+      else if (/^set group address /.test(s)) b.addrgrp.push(s);
+      else if (/^set group service /.test(s)) b.svcgrp.push(s);
+      else if (/^set service /.test(s)) b.service.push(s);
+      else if (/^set interface /.test(s)) { b.interface.push(s); if (/ zone "/.test(s)) b.zone.push(s); if (/\bmip\b/.test(s)) b.nat.push(s); }
+      else if (/^set zone /.test(s)) b.zone.push(s);
+      else if (/^set route /.test(s)) b.routing.push(s);
+      else if (/^set policy id \d+/.test(s)) { b.policy.push(s); if (_soTok(s).length===4) inPol=true; }
+      else if (/^set (hostname|dns host)/.test(s)) b.system.push(s);
+    });
+    return b;
+  }
+  var B = buildBuckets();
+
+  // ===== FortiGate config 출력 빌드 =====
+  var out = {};
+
+  // -- system --
+  var sysL = [];
+  if (sys.hostname) { sysL.push('config system global'); sysL.push('    set hostname "'+_soName(sys.hostname)+'"'); sysL.push('end'); }
+  if (sys.dns.length) {
+    sysL.push('config system dns');
+    if (sys.dns[0]) sysL.push('    set primary '+sys.dns[0]);
+    if (sys.dns[1]) sysL.push('    set secondary '+sys.dns[1]);
+    sysL.push('end');
+  }
+  out.system = { config: sysL.join('\n'), count:(sys.hostname?1:0)+(sys.dns.length?1:0), original: B.system.join('\n') };
+
+  // -- interface --
+  var ifL = ['config system interface'];
+  physIfs.forEach(function(ifn){
+    var inf = ifaces[ifn] || {};
+    ifL.push('  edit "'+mapIf(ifn)+'"');
+    ifL.push('    set alias "'+ifn+'"');
+    if (inf.cidr) { var c = inf.cidr.split('/'); ifL.push('    set mode static'); ifL.push('    set ip '+c[0]+' '+cidrToNetmask(c[1])); }
+    if (inf.manageable) ifL.push('    set allowaccess ping https ssh');
+    ifL.push('  next');
+  });
+  ifL.push('end');
+  out.interface = { config: ifL.join('\n'), count: physIfs.length, original: B.interface.join('\n') };
+
+  // -- zone --
+  var zL = ['config system zone'], zCount = 0;
+  Object.keys(zoneIf).forEach(function(z){
+    if (!zoneIf[z].length) return;
+    zL.push('  edit "'+_soName(z)+'"');
+    zL.push('    set interface '+zoneIf[z].map(q).join(' '));
+    zL.push('  next'); zCount++;
+  });
+  zL.push('end');
+  out.zone = { config: zL.join('\n'), count: zCount, original: B.zone.join('\n') };
+
+  // -- address --
+  var aL = ['config firewall address'];
+  addrOrder.forEach(function(n){
+    var a = addrs[n];
+    aL.push('  edit "'+_soName(n)+'"');
+    aL.push('    set subnet '+a.ip+' '+a.mask);
+    if (a.comment) aL.push('    set comment "'+_soName(a.comment)+'"');
+    aL.push('  next');
+  });
+  aL.push('end');
+  out.address = { config: aL.join('\n'), count: addrOrder.length, original: B.address.join('\n') };
+
+  // -- addrgrp --
+  var agL = ['config firewall addrgrp'], agCount = 0, emptyGrps = [];
+  grpOrder.forEach(function(n){
+    var g = grps[n];
+    if (!g.members.length) { emptyGrps.push(n); return; }
+    agL.push('  edit "'+_soName(n)+'"');
+    agL.push('    set member '+_uniq(g.members).map(function(m){ return q(_addrRef(m)); }).join(' '));
+    if (g.comment) agL.push('    set comment "'+_soName(g.comment)+'"');
+    agL.push('  next'); agCount++;
+  });
+  agL.push('end');
+  out.addrgrp = { config: agL.join('\n'), count: agCount, original: B.addrgrp.join('\n') };
+
+  // -- service --
+  var scL = ['config firewall service custom'];
+  svcOrder.forEach(function(n){
+    var tcp=[], udp=[], other=[];
+    svcs[n].forEach(function(e){
+      if (e.other) { other.push(e.proto); return; }
+      var d = (e.dl===e.dh) ? (''+e.dl) : (e.dl+'-'+e.dh);
+      var srcDefault = (e.sl<=1 && e.sh>=65535);
+      var r = srcDefault ? d : d+':'+(e.sl===e.sh ? e.sl : e.sl+'-'+e.sh);
+      (e.proto==='tcp' ? tcp : udp).push(r);
+    });
+    scL.push('  edit "'+_soName(n)+'"');
+    if (tcp.length) scL.push('    set tcp-portrange '+tcp.join(' '));
+    if (udp.length) scL.push('    set udp-portrange '+udp.join(' '));
+    if (!tcp.length && !udp.length) scL.push('    ! ScreenOS protocol='+(other.join(',')||'?')+' → FortiGate 수동 확인');
+    scL.push('  next');
+  });
+  scL.push('end');
+  out.service = { config: scL.join('\n'), count: svcOrder.length, original: B.service.join('\n') };
+
+  // -- svcgrp --
+  var sgL = ['config firewall service group'];
+  svcGrpOrder.forEach(function(n){
+    sgL.push('  edit "'+_soName(n)+'"');
+    sgL.push('    set member '+_uniq(svcGrps[n]).map(function(m){ return q(_svcRef(m)); }).join(' '));
+    sgL.push('  next');
+  });
+  sgL.push('end');
+  out.svcgrp = { config: sgL.join('\n'), count: svcGrpOrder.length, original: B.svcgrp.join('\n') };
+
+  // -- routing --
+  var rL = ['config router static'], rCount = 0;
+  routes.forEach(function(rt){
+    rCount++;
+    rL.push('  edit '+rCount);
+    rL.push('    set dst '+rt.dst+' '+rt.mask);
+    if (rt.gw) rL.push('    set gateway '+rt.gw);
+    if (rt.dev) rL.push('    set device "'+rt.dev+'"');
+    if (rt.tunnel) rL.push('    ! ScreenOS tunnel 인터페이스 경로 → IPsec 터널/디바이스 수동 확인');
+    rL.push('  next');
+  });
+  rL.push('end');
+  out.routing = { config: rL.join('\n'), count: rCount, original: B.routing.join('\n') };
+
+  // -- nat (MIP → static VIP) --
+  var vL = ['config firewall vip'], vCount = 0, seenVip = {}, vipNames = {};
+  mips.forEach(function(mp){
+    var vn = 'MIP_'+mp.pub;
+    if (seenVip[vn]) return; seenVip[vn] = true; vipNames[vn] = 1;
+    vL.push('  edit "'+vn+'"');
+    vL.push('    set extip '+mp.pub);
+    vL.push('    set extintf "'+mp.extif+'"');
+    vL.push('    set mappedip "'+mp.host+'"');
+    vL.push('  next'); vCount++;
+  });
+  vL.push('end');
+  out.nat = { config: vL.join('\n'), count: vCount, original: B.nat.join('\n') };
+
+  // -- policy --
+  var definedAddr = {}; addrOrder.forEach(function(n){ definedAddr[_soName(n)]=1; }); grpOrder.forEach(function(n){ if(grps[n].members.length) definedAddr[_soName(n)]=1; });
+  var definedSvc = {};  svcOrder.forEach(function(n){ definedSvc[_soName(n)]=1; }); svcGrpOrder.forEach(function(n){ definedSvc[_soName(n)]=1; });
+  var BUILTIN_SVC = {ALL:1,ANY:1,HTTP:1,HTTPS:1,DNS:1,SMTP:1,POP3:1,IMAP:1,FTP:1,SSH:1,TELNET:1,PING:1,SNMP:1,NTP:1,DHCP:1,SYSLOG:1,TFTP:1,LDAP:1,RADIUS:1,RDP:1,'MS-SQL':1,SQL:1,IKE:1,ESP:1,GRE:1,'PING-ICMP':1,ICMP:1};
+  var undefAddr = {}, undefSvc = {};
+  var pL = ['config firewall policy'];
+  policies.forEach(function(pol){
+    var fgName = _soName(pol.name || ('Policy_'+pol.id));
+    _screenosPolNameMap[pol.id] = fgName;
+    var srcs = _uniq(pol.srcs).map(_addrRef);
+    var dsts = _uniq(pol.dsts).map(_addrRef);
+    var svcL = _uniq(pol.svcs).map(_svcRef);
+    srcs.concat(dsts).forEach(function(a){ if (a!=='all' && !definedAddr[a] && !vipNames[a]) undefAddr[a]=1; });
+    svcL.forEach(function(sv){ if (!definedSvc[sv] && !BUILTIN_SVC[sv.toUpperCase()]) undefSvc[sv]=1; });
+    pL.push('  edit '+pol.id);
+    pL.push('    set name "'+fgName+'"');
+    pL.push('    set srcintf "'+_soName(pol.fz||'any')+'"');
+    pL.push('    set dstintf "'+_soName(pol.tz||'any')+'"');
+    pL.push('    set srcaddr '+srcs.map(q).join(' '));
+    pL.push('    set dstaddr '+dsts.map(q).join(' '));
+    pL.push('    set service '+svcL.map(q).join(' '));
+    pL.push('    set schedule "always"');
+    pL.push('    set action '+pol.action);
+    if (pol.disable) pL.push('    set status disable');
+    if (pol.natSrc)  pL.push('    set nat enable');
+    if (pol.log)     pL.push('    set logtraffic all');
+    if (pol.isTunnel) pL.push('    ! ScreenOS tunnel (VPN "'+_soName(pol.vpnName)+'") → IPsec phase1/phase2 및 dstintf 수동 설정 필요');
+    pL.push('  next');
+  });
+  pL.push('end');
+  out.policy = { config: pL.join('\n'), count: policies.length, original: B.policy.join('\n') };
+
+  // -- unmapped (미변환) --
+  var umItems = [], umOrig = [];
+  Object.keys(unmappedRaw).forEach(function(cat){
+    umItems.push({ label:cat, reason:unmappedRaw[cat].length+'개 라인 — 아래 원본을 참고하여 수동 설정' });
+    umOrig.push('! ── '+cat+' ──');
+    unmappedRaw[cat].forEach(function(l){ umOrig.push(l); });
+    umOrig.push('');
+  });
+  if (emptyGrps.length) umItems.push({ label:'빈 주소그룹', reason:emptyGrps.length+'개 (멤버 없음, 생략됨): '+emptyGrps.slice(0,8).join(', ') });
+  out.unmapped = { items:umItems, count:umItems.length, original:umOrig.join('\n'), config:'' };
+
+  // ── 변환 경고 ──
+  convertWarnings.push('ScreenOS 변환은 <b>초안</b>입니다. VPN(IPsec)·MIP/DIP·인증 설정은 반드시 수동 검토하세요.');
+  convertWarnings.push('인터페이스 매핑 → ' + (physIfs.length ? physIfs.map(function(f){ return f+'→'+mapIf(f); }).join(', ') : '없음') + ' (필요 시 정책의 srcintf/dstintf 확인)');
+  var uaK = Object.keys(undefAddr), usK = Object.keys(undefSvc);
+  if (uaK.length) convertWarnings.push('정책이 참조하지만 정의되지 않은 <b>주소</b> '+uaK.length+'개: '+uaK.slice(0,8).join(', ')+(uaK.length>8?' …':''));
+  if (usK.length) convertWarnings.push('정책이 참조하지만 정의되지 않은 <b>서비스</b> '+usK.length+'개: '+usK.slice(0,8).join(', ')+(usK.length>8?' …':''));
+
+  return out;
+}
+
 // ===== NAT 정책 xlsx 변환 =====
 function convertPanoNat(rows) {
   // rows[0]=헤더, rows[1+]=데이터
@@ -4110,6 +4537,31 @@ function runConversion() {
       if (r && (r.count > 0 || t === 'unmapped')) {
         convertResults[t] = r;
         sections.push({label: junosLabelMap[t], type: t, count: r.count});
+      }
+    });
+  }
+
+  // ScreenOS 단일 파일 → 여러 섹션 동시 추출
+  if (convertFiles['screenos'] && convertFiles['screenos'].content) {
+    var soRes = convertScreenOS(convertFiles['screenos'].content);
+    var soLabelMap = {
+      system:    '시스템 설정',
+      interface: '인터페이스',
+      zone:      'Zone',
+      address:   '주소 오브젝트',
+      addrgrp:   '주소 그룹',
+      service:   '서비스 오브젝트',
+      svcgrp:    '서비스 그룹',
+      policy:    '보안정책',
+      routing:   '정적 라우팅',
+      nat:       'NAT (MIP→VIP)',
+      unmapped:  '⚠️ 미변환 항목'
+    };
+    ['system','interface','zone','address','addrgrp','service','svcgrp','policy','routing','nat','unmapped'].forEach(function(t) {
+      var r = soRes[t];
+      if (r && (r.count > 0 || t === 'unmapped')) {
+        convertResults[t] = r;
+        sections.push({ label: soLabelMap[t], type: t, count: r.count });
       }
     });
   }
@@ -4391,6 +4843,41 @@ function parseOrigBlocks(type, original) {
   var isJunos = lines.some(function(l){ return /^set /.test(l); });
   var entries = {};
 
+  // ── ScreenOS 원본 그룹핑 (FG 블록 키와 동일하게 매칭) ──
+  var isScreenOS = lines.some(function(l){
+    return /^set policy id \d+/.test(l) || /^set group (address|service) /.test(l) ||
+           /^set address "[^"]+" "[^"]+" \d/.test(l) || /^set interface "[^"]+" mip /.test(l);
+  });
+  if (isScreenOS) {
+    var soCur = null; // 정책 서브블록 그룹핑용
+    lines.forEach(function(l){
+      var p = _soTok(l);
+      if (p[0] !== 'set' && p[0] !== 'unset') return;
+      var key = null;
+      if (type==='address'   && p[1]==='address' && p[3] && /^\d+\./.test(p[4]||'')) key = p[3];
+      else if (type==='addrgrp' && p[1]==='group' && p[2]==='address') key = p[3];
+      else if (type==='svcgrp'  && p[1]==='group' && p[2]==='service') key = p[3];
+      else if (type==='service' && p[1]==='service' && p[2]) key = p[2];
+      else if (type==='routing' && p[1]==='route' && p[2]) { var d=p[2].split('/'); key = d[0]+'/'+netmaskToCidr(cidrToNetmask(d[1]||'32')); }
+      else if (type==='interface' && p[1]==='interface' && /^ethernet/.test(p[2]||'')) key = _screenosIfMap[p[2]] || p[2];
+      else if (type==='zone') {
+        if (p[1]==='zone' && p[2]==='id') key = p[4];
+        else if (p[1]==='zone' && p[2]) key = p[2];
+        else if (p[1]==='interface' && p[3]==='zone') key = p[4];
+      }
+      else if (type==='nat' && p[1]==='interface' && p.indexOf('mip')>=0) key = '[VIP] MIP_' + p[p.indexOf('mip')+1];
+      else if (type==='policy') {
+        if (p[1]==='policy' && p[2]==='id' && p[3]) { soCur = _screenosPolNameMap[p[3]] || ('Policy_'+p[3]); key = soCur; }
+        else if (soCur && (p[1]==='src-address' || p[1]==='dst-address' || p[1]==='service')) key = soCur;
+        if (l.trim()==='exit') soCur = null;
+      }
+      if (key) { if (!entries[key]) entries[key] = []; entries[key].push(l.trim()); }
+    });
+    var soRes = {};
+    Object.keys(entries).forEach(function(k){ soRes[k] = entries[k].join('\n'); });
+    return soRes;
+  }
+
   if (isJunos) {
     lines.forEach(function(l) {
       var p = l.split(/\s+/);
@@ -4531,7 +5018,7 @@ function downloadConvertCSV() {
     policy:'보안정책', routing:'정적 라우팅', nat:'NAT 정책'
   };
 
-  var rows = [['섹션','항목명','원본 Config (JunOS/PAN-OS)','FortiGate 변환 Config','비고']];
+  var rows = [['섹션','항목명','원본 Config (JunOS/PAN-OS/ScreenOS)','FortiGate 변환 Config','비고']];
 
   sectionOrder.forEach(function(type) {
     var r = convertResults[type];
@@ -4585,7 +5072,7 @@ function downloadConvertCSV() {
 
 function downloadConvert() {
   var order = ['system','interface','zone','address','addrgrp','service','svcgrp','policy','routing','nat'];
-  var src = convertFiles['junos'] ? 'JunOS' : 'PAN-OS';
+  var src = convertFiles['junos'] ? 'JunOS' : convertFiles['screenos'] ? 'ScreenOS' : 'PAN-OS';
   var parts = ['! FortiGate Config (' + src + ' → FortiGate 변환)', '! 생성: ' + new Date().toLocaleString('ko-KR'), ''];
   for (var i = 0; i < order.length; i++) {
     var type = order[i];

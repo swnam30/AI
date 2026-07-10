@@ -27,7 +27,7 @@ README.md / .gitignore / HANDOFF.md(이 파일)
 | ② 정책 뷰어 | `viewer` | `tab-viewer` | 306 | 완성 |
 | ③ Event Log 분석 | `log` | `tab-log` | 358 | 완성 |
 | ④ 점검보고서 | `report` | `tab-report` | 461 | 개발중 |
-| ⑤ Config 변환 | `convert` | `tab-convert` | 666 | 개발중 |
+| ⑤ Config 변환 | `convert` | `tab-convert` | 666 | PAN-OS·JunOS·**ScreenOS** 지원 |
 | ⑥ 멀티벤더 뷰어 | `multivendor` | `tab-multivendor` | 761 | 개발중 |
 | ⑦ 포트 분석 | `portanalysis` | `tab-portanalysis` | 803 | 완료 |
 
@@ -54,6 +54,19 @@ README.md / .gitignore / HANDOFF.md(이 파일)
 - 푸시: `git push -u origin claude/port-scanner-exe-b25kju` (네트워크 실패 시 지수백오프 재시도).
 - PR은 사용자가 명시적으로 요청할 때만 생성.
 - HTML 편집 시: `<!DOCTYPE>`/`<head>` 등 기존 구조 유지, ID 충돌 주의, 전역 변수/함수는 `<script>`(937줄~) 내에 추가.
+
+## 지난 세션 완료 (⑤ Config 변환 — ScreenOS 추가)
+- **NetScreen ScreenOS(SSG/ISG) → FortiGate 변환** 신규 구현. 소스 라디오 활성화.
+- 함수: `convertScreenOS(text)` (+ 헬퍼 `_soTok`/`_soName`/`_soMipName`). JunOS와 동일하게
+  단일 파일 → 다중 섹션(system/interface/zone/address/addrgrp/service/svcgrp/policy/routing/nat/unmapped) 반환.
+- 변환 매핑: `set address`→firewall address, `set group address`→addrgrp, `set service`(+ 연속)→service custom
+  (tcp/udp-portrange, src 1-65535 생략), `set group service`→service group, `set policy id`(서브블록 src/dst/service 병합,
+  `nat src`→`set nat enable`, `disable`→`set status disable`, `permit/deny`, `tunnel`→accept+IPsec 주석)→firewall policy,
+  `set route`→router static, `set interface … mip`→firewall vip(static NAT), zone→system zone(ethernet0/N→portN 매핑).
+- **인코딩**: ScreenOS config는 EUC-KR/CP949 → `handleConvertFiles`가 ArrayBuffer로 읽어 UTF-8 실패 시 `TextDecoder('euc-kr')` 재디코딩.
+- 좌우 diff/CSV 정렬: `detectConvertFileType`·`CONVERT_TYPE_META`·`runConversion`·`parseOrigBlocks`(screenos 분기)·`downloadConvert`에 screenos 배선.
+- e2e 검증: 실제 SSG550 config(9,868줄)로 Chromium 업로드→변환, pageerror 0. 주소3982·정책186·서비스107·MIP(VIP)39 등 정상, 한글 오브젝트명·VPN명 복원 확인.
+- 미구현(수동): IPsec VPN(IKE/phase), DIP, 관리자/SNMP/인증 → unmapped 섹션 + 경고로 안내.
 
 ## 다음 작업
 **수정할 탭과 원하는 변경 내용을 사용자에게 확인한 뒤 진행.**
