@@ -4040,21 +4040,32 @@ function convertScreenOS(text) {
     if (t[0] !== 'set' && t[0] !== 'unset') continue;
     var kw = t[1];
 
-    // ── 주소 오브젝트 ──  set address "zone" "name" IP MASK [comment]
-    if (t[0]==='set' && kw==='address' && t.length>=6 && /^\d+\.\d+\.\d+\.\d+$/.test(t[4])) {
+    // ── 주소 오브젝트 ──  set address "zone" "name" (IP MASK | FQDN) [comment]
+    if (t[0]==='set' && kw==='address' && t.length>=5) {
       var an = t[3];
       if (!/^any$/i.test(an) && !addrs[an]) {
-        addrs[an] = { ip:t[4], mask:t[5], comment:(t[6] && t[6]!==an) ? t[6] : '' };
+        if (/^\d+\.\d+\.\d+\.\d+$/.test(t[4]) && /^\d+\.\d+\.\d+\.\d+$/.test(t[5]||'')) {
+          addrs[an] = { ip:t[4], mask:t[5], comment:(t[6] && t[6]!==an) ? t[6] : '' };
+        } else {
+          // 도메인 주소 (ScreenOS domain-name) → FortiGate FQDN 타입
+          addrs[an] = { fqdn:t[4], comment:(t[5] && t[5]!==an) ? t[5] : '' };
+        }
         addrOrder.push(an);
       }
       continue;
     }
     // ── 주소 그룹 ──  set group address "zone" "grp" [add "member"] [comment "x"]
-    if (t[0]==='set' && kw==='group' && t[2]==='address') {
-      var gn = t[3];
+    // 주의: t[3]=존, t[4]=그룹명 (서비스 그룹과 달리 존이 먼저 온다)
+    if (t[0]==='set' && kw==='group' && t[2]==='address' && t[4]) {
+      var gn = (t[4]==='add' || t[4]==='comment') ? t[3] : t[4]; // 존 생략 변형 방어
       if (!grps[gn]) { grps[gn] = { members:[], comment:'' }; grpOrder.push(gn); }
       var ai = t.indexOf('add');     if (ai>=0 && t[ai+1]) grps[gn].members.push(t[ai+1]);
       var ci = t.indexOf('comment'); if (ci>=0 && t[ci+1]) grps[gn].comment = t[ci+1];
+      continue;
+    }
+    // 그룹 정의만 있는 형태: set group address "zone" "grp"
+    if (t[0]==='set' && kw==='group' && t[2]==='address' && t[3]) {
+      if (!grps[t[3]]) { grps[t[3]] = { members:[], comment:'' }; grpOrder.push(t[3]); }
       continue;
     }
     // ── 서비스 그룹 ──  set group service "grp" [add "member"]
@@ -4107,6 +4118,11 @@ function convertScreenOS(text) {
     }
     // ── Zone 정의 ──
     if (t[0]==='set' && kw==='zone' && t[2]) {
+      // screen 옵션(DoS 방어)은 FortiGate DoS policy 영역 → 미변환 안내로 분리
+      if (t[3]==='screen') {
+        (unmappedRaw['Zone Screen (DoS 방어)'] = unmappedRaw['Zone Screen (DoS 방어)'] || []).push(line);
+        continue;
+      }
       if (t[2]==='id' && t[4]) zonesSeen[t[4]] = true;
       else zonesSeen[t[2]] = true;
       continue;
@@ -4180,7 +4196,7 @@ function convertScreenOS(text) {
     lines.forEach(function(l){
       var s = l.trim(); if (!s) return;
       if (inPol) { b.policy.push(s); if (s==='exit') inPol=false; return; }
-      if (/^set address "[^"]+" "[^"]+" \d/.test(s)) b.address.push(s);
+      if (/^set address "/.test(s)) b.address.push(s);
       else if (/^set group address /.test(s)) b.addrgrp.push(s);
       else if (/^set group service /.test(s)) b.svcgrp.push(s);
       else if (/^set service /.test(s)) b.service.push(s);
@@ -4237,7 +4253,12 @@ function convertScreenOS(text) {
   addrOrder.forEach(function(n){
     var a = addrs[n];
     aL.push('  edit "'+_soName(n)+'"');
-    aL.push('    set subnet '+a.ip+' '+a.mask);
+    if (a.fqdn) {
+      aL.push('    set type fqdn');
+      aL.push('    set fqdn "'+a.fqdn+'"');
+    } else {
+      aL.push('    set subnet '+a.ip+' '+a.mask);
+    }
     if (a.comment) aL.push('    set comment "'+_soName(a.comment)+'"');
     aL.push('  next');
   });
@@ -4859,8 +4880,8 @@ function parseOrigBlocks(type, original) {
       var p = _soTok(l);
       if (p[0] !== 'set' && p[0] !== 'unset') return;
       var key = null;
-      if (type==='address'   && p[1]==='address' && p[3] && /^\d+\./.test(p[4]||'')) key = p[3];
-      else if (type==='addrgrp' && p[1]==='group' && p[2]==='address') key = p[3];
+      if (type==='address'   && p[1]==='address' && p[3]) key = p[3];
+      else if (type==='addrgrp' && p[1]==='group' && p[2]==='address') key = (p[4] && p[4]!=='add' && p[4]!=='comment') ? p[4] : p[3];
       else if (type==='svcgrp'  && p[1]==='group' && p[2]==='service') key = p[3];
       else if (type==='service' && p[1]==='service' && p[2]) key = p[2];
       else if (type==='routing' && p[1]==='route' && p[2]) { var d=p[2].split('/'); key = d[0]+'/'+netmaskToCidr(cidrToNetmask(d[1]||'32')); }

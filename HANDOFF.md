@@ -70,7 +70,12 @@ README.md / .gitignore / HANDOFF.md(이 파일)
   Fortinet KB "Mapping VIP outbound connections (Source NAT)".
 - **인코딩**: ScreenOS config는 EUC-KR/CP949 → `handleConvertFiles`가 ArrayBuffer로 읽어 UTF-8 실패 시 `TextDecoder('euc-kr')` 재디코딩.
 - 좌우 diff/CSV 정렬: `detectConvertFileType`·`CONVERT_TYPE_META`·`runConversion`·`parseOrigBlocks`(screenos 분기)·`downloadConvert`에 screenos 배선.
-- e2e 검증: 실제 SSG550 config(9,868줄)로 Chromium 업로드→변환, pageerror 0. 주소3982·정책186·서비스107·MIP(VIP)39 등 정상, 한글 오브젝트명·VPN명 복원 확인.
+- e2e 검증: 실제 SSG550 config(9,868줄)로 Chromium 업로드→변환, pageerror 0. 한글 오브젝트명·VPN명 복원 확인.
+- **커버리지 전수 검증 완료** (독립 파서로 원본 재파싱 → 이름 단위 대조): 주소 4004(FQDN 22 포함)·
+  주소그룹 70·서비스 107·서비스그룹 1·정책 186(disable 28)·MIP→VIP 39·라우팅 15·인터페이스 3·Zone 3 — 전 항목 일치.
+  검증 과정에서 수정한 버그: ①주소그룹명을 존(t[3])으로 잘못 읽던 것 → t[4]로 수정(70개 그룹 복원),
+  ②FQDN(도메인) 주소 22개 침묵 누락 → `set type fqdn`으로 변환 추가, ③zone screen(DoS) 옵션 52줄 → 미변환 안내로 분리.
+  잔여 침묵 무시 73줄은 clock/ntp/vrouter/log/flow 등 정책 마이그레이션과 무관한 시스템 설정.
 - 미구현(수동): IPsec VPN(IKE/phase), DIP, 관리자/SNMP/인증 → unmapped 섹션 + 경고로 안내.
 
 ## 다음 작업
