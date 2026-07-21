@@ -2864,10 +2864,21 @@ function ipInSubnet(ip, ifCidr) {
   } catch(e) { return false; }
 }
 
+// srcintf/dstintf(존/인터페이스)용 — FortiGate는 정책에서 "any" 인터페이스를 허용
 function toFGList(val) {
   if (!val || val.trim() === 'any') return '"any"';
   // PAN-OS CSV는 다중 값을 세미콜론(;) 또는 공백으로 구분
   return val.trim().split(/[;\s]+/).filter(Boolean).map(function(v){ return '"'+v.trim()+'"'; }).join(' ');
+}
+// 주소 오브젝트용 — FortiGate 내장 전체주소는 "all" (❗ "any"는 존재하지 않는 객체 → import 오류)
+function toFGAddrList(val) {
+  if (!val || /^any$/i.test(val.trim())) return '"all"';
+  return val.trim().split(/[;\s]+/).filter(Boolean).map(function(v){ return '"'+(/^any$/i.test(v)?'all':v.trim())+'"'; }).join(' ');
+}
+// 서비스 오브젝트용 — FortiGate 내장 전체서비스는 "ALL" (❗ "any" 아님)
+function toFGSvcList(val) {
+  if (!val || /^any$/i.test(val.trim())) return '"ALL"';
+  return val.trim().split(/[;\s]+/).filter(Boolean).map(function(v){ return '"'+(/^any$/i.test(v)?'ALL':v.trim())+'"'; }).join(' ');
 }
 
 // ===== 보안정책 CSV 변환 =====
@@ -2893,16 +2904,17 @@ function convertPanoPolicy(text) {
     var action  = (f[cols['Action']]||'deny').toLowerCase().trim();
     var desc    = (f[cols['Description']]||'').trim();
     var app     = (f[cols['Application']]||'').trim();
-    if (action === 'allow') action = 'accept';
+    // PAN-OS action: allow→accept, 그 외(deny/drop/reset-client/reset-server/reset-both)→deny
+    action = (action === 'allow' || action === 'accept') ? 'accept' : 'deny';
     if (service === 'application-default') { service = 'any'; appDefaultCount++; }
     count++;
     output += '    edit ' + count + '\n';
     output += '        set name "' + name.replace(/"/g,'') + '"\n';
     output += '        set srcintf ' + toFGList(srczone) + '\n';
     output += '        set dstintf ' + toFGList(dstzone) + '\n';
-    output += '        set srcaddr ' + toFGList(srcaddr) + '\n';
-    output += '        set dstaddr ' + toFGList(dstaddr) + '\n';
-    output += '        set service ' + toFGList(service) + '\n';
+    output += '        set srcaddr ' + toFGAddrList(srcaddr) + '\n';
+    output += '        set dstaddr ' + toFGAddrList(dstaddr) + '\n';
+    output += '        set service ' + toFGSvcList(service) + '\n';
     output += '        set action ' + action + '\n';
     output += '        set schedule "always"\n';
     output += '        set logtraffic all\n';
@@ -2911,7 +2923,7 @@ function convertPanoPolicy(text) {
     output += '    next\n';
   }
   output += 'end\n';
-  if (appDefaultCount > 0) convertWarnings.push('보안정책 '+appDefaultCount+'개 서비스가 "application-default" → "any"로 변환됨. 필요 시 개별 서비스를 명시적으로 지정하세요.');
+  if (appDefaultCount > 0) convertWarnings.push('보안정책 '+appDefaultCount+'개 서비스가 "application-default" → "ALL"로 변환됨. 필요 시 개별 서비스를 명시적으로 지정하세요.');
   return { config: output, count: count };
 }
 
@@ -3184,6 +3196,11 @@ function junosAppToFG(app) {
   if (!app) return 'ALL';
   var m = JUNOS_APP_MAP[app.toLowerCase()];
   return m || app;
+}
+
+// JunOS 주소 "any"(any-ipv4/any-ipv6) → FortiGate 내장 전체주소 "all" (❗ "any" 아님)
+function junosAddrToFG(a) {
+  return /^any(-ipv4|-ipv6)?$/i.test(a) ? 'all' : a;
 }
 
 function convertJunos(text) {
@@ -3696,8 +3713,8 @@ function convertJunos(text) {
     polOut+='        set name "'+fgName+'"\n';
     polOut+='        set srcintf "'+srcIntf+'"\n';
     polOut+='        set dstintf "'+dstIntf+'"\n';
-    polOut+='        set srcaddr '+src.map(function(a){return '"'+a+'"';}).join(' ')+'\n';
-    polOut+='        set dstaddr '+dst.map(function(a){return '"'+a+'"';}).join(' ')+'\n';
+    polOut+='        set srcaddr '+src.map(function(a){return '"'+junosAddrToFG(a)+'"';}).join(' ')+'\n';
+    polOut+='        set dstaddr '+dst.map(function(a){return '"'+junosAddrToFG(a)+'"';}).join(' ')+'\n';
     polOut+='        set service '+svcs.map(function(s){return '"'+s+'"';}).join(' ')+'\n';
     polOut+='        set action '+po.action+'\n';
     if(po.log) polOut+='        set logtraffic all\n';
@@ -3810,8 +3827,8 @@ function convertJunos(text) {
     Object.keys(rs.rules).forEach(function(rn) {
       var rule = rs.rules[rn];
       if (rule.action === 'off') {
-        var srcQ = rule.srcAddrs.length ? rule.srcAddrs.map(function(a){return '"'+a+'"';}).join(' ') : '"any"';
-        var dstQ = rule.dstAddrs.length ? rule.dstAddrs.map(function(a){return '"'+a+'"';}).join(' ') : '"any"';
+        var srcQ = rule.srcAddrs.length ? rule.srcAddrs.map(function(a){return '"'+junosAddrToFG(a)+'"';}).join(' ') : '"all"';
+        var dstQ = rule.dstAddrs.length ? rule.dstAddrs.map(function(a){return '"'+junosAddrToFG(a)+'"';}).join(' ') : '"all"';
         natPolOut += '    ! ▶ [NAT-OFF] '+rs.fromZone+'→'+rs.toZone+' / '+rn+' — 삽입: '+insertBefore+'\n';
         natPolOut += '    edit "NAT-OFF_'+rn+'"\n';
         natPolOut += '        set srcintf "'+rs.fromZone+'"\n';
@@ -3826,8 +3843,8 @@ function convertJunos(text) {
           insertBefore:insertBefore, insertBeforePk: zonePairPols[0]||'',
           action:'신규 정책 "NAT-OFF_'+rn+'" 생성 (nat disable)', note:(rule.dstAddrs.join(', ')||'any')});
       } else if (rule.action === 'pool' || rule.action === 'interface') {
-        var srcQs = rule.srcAddrs.length ? rule.srcAddrs.map(function(a){return '"'+a+'"';}).join(' ') : '"any"';
-        var dstQs = rule.dstAddrs.length ? rule.dstAddrs.map(function(a){return '"'+a+'"';}).join(' ') : '"any"';
+        var srcQs = rule.srcAddrs.length ? rule.srcAddrs.map(function(a){return '"'+junosAddrToFG(a)+'"';}).join(' ') : '"all"';
+        var dstQs = rule.dstAddrs.length ? rule.dstAddrs.map(function(a){return '"'+junosAddrToFG(a)+'"';}).join(' ') : '"all"';
         var polLabel2 = rule.action==='interface' ? 'SNAT_if_'+rn : 'SNAT_'+rn;
         natPolOut += '    ! ▶ [SNAT] '+rs.fromZone+'→'+rs.toZone+' / '+rn+(rule.action==='interface'?' (interface-nat)':' pool:"'+rule.pool+'"')+'\n';
         natPolOut += '    edit "'+polLabel2+'"\n';
@@ -3902,7 +3919,7 @@ function convertJunos(text) {
       natPolOut += '    edit "VIP_'+rn+'"\n';
       natPolOut += '        set srcintf "'+(dnatSrcZone||'any')+'"\n';
       natPolOut += '        set dstintf "'+(dnatDstZone||'! 수동 확인 필요')+'"\n';
-      natPolOut += '        set srcaddr "any"\n';
+      natPolOut += '        set srcaddr "all"\n';
       natPolOut += '        set dstaddr "VIP_'+rn+'"\n';
       natPolOut += '        set service "ALL"\n';
       natPolOut += '        set action accept\n';

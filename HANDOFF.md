@@ -83,6 +83,18 @@ README.md / .gitignore / HANDOFF.md(이 파일)
   객체별 좌우 라인수 패딩으로 정렬(연동 스크롤 호환). fgMaps=parseFGBlocksForType로 재사용.
 - **CSV export 버그 수정**: `downloadConvertCSV`가 unmapped item의 없는 `it.lines`를 참조해 예외로 버튼 무반응 → `it.lines?` 가드.
 
+## 지난 세션 완료 (⑤ 변환기 버그 수정 — PAN-OS/JunOS/ScreenOS 공통 점검)
+- **FortiGate 내장 객체명 오류 수정**: 정책의 전체주소는 `all`, 전체서비스는 `ALL`이 맞는데
+  PAN-OS·JunOS 변환기가 `"any"`를 그대로 출력 → FortiGate import 시 "객체 없음" 오류였음.
+  - PAN-OS: `toFGAddrList`(any→all)·`toFGSvcList`(any→ALL) 신설, 정책 srcaddr/dstaddr/service에 적용.
+    srcintf/dstintf는 FortiGate가 "any" 인터페이스를 허용하므로 기존 `toFGList` 유지.
+  - JunOS: `junosAddrToFG`(any/any-ipv4/any-ipv6→all) 신설, 정책·NAT(NAT-OFF/SNAT/DNAT) 주소 출력에 적용.
+    서비스 any는 JUNOS_APP_MAP에 이미 `any→ALL`로 매핑되어 있어 정상.
+- **PAN-OS action 매핑 수정**: `allow→accept`만 처리하고 `drop/reset-client/reset-server/reset-both`는
+  그대로 흘려 `set action drop`(무효) 출력 → allow/accept 외 전부 `deny`로 정규화.
+- ScreenOS는 이미 all/ALL 정규화(`_addrRef`/`_svcRef`) 되어 있어 변경 없음. 커버리지 전항목 일치 유지.
+- 검증: 합성 JunOS/PAN-OS config로 in-page 변환 → any→all/ALL, drop/reset→deny 확인, pageerror 0.
+
 ## 다음 작업
 **수정할 탭과 원하는 변경 내용을 사용자에게 확인한 뒤 진행.**
 (예: "④ 점검보고서 탭에 ~~ 기능 추가", "② 정책 뷰어에서 ~~ 수정")
